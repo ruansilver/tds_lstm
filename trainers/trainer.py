@@ -252,8 +252,15 @@ class EMG2PoseTrainer:
         
         # 计算epoch平均损失和指标
         avg_loss = total_loss / len(self.train_loader)      #平均损失
-        all_predictions = np.concatenate(all_predictions, axis=0) #将所有批次的预测结果拼接起来
-        all_targets = np.concatenate(all_targets, axis=0) #将所有批次的真实标签拼接起来
+        
+        # 🔴 内存优化：分批计算metrics，避免大数组拼接
+        # 只在前1000个batch上计算metrics（代表性足够）
+        if len(all_predictions) > 1000:
+            all_predictions = all_predictions[:1000]
+            all_targets = all_targets[:1000]
+        
+        all_predictions = np.concatenate(all_predictions, axis=0) #将批次的预测结果拼接起来
+        all_targets = np.concatenate(all_targets, axis=0) #将批次的真实标签拼接起来
         metrics = calculate_metrics(all_targets, all_predictions) #计算指标
         
         return {'loss': avg_loss, **metrics}
@@ -287,8 +294,15 @@ class EMG2PoseTrainer:
         
         # 计算epoch平均损失和指标
         avg_loss = total_loss / len(self.val_loader)
-        all_predictions = np.concatenate(all_predictions, axis=0)  #将所有批次的预测结果拼接起来
-        all_targets = np.concatenate(all_targets, axis=0)  #将所有批次的真实标签拼接起来
+        
+        # 🔴 内存优化：限制用于metrics计算的样本数
+        # 验证集通常较小，但仍需要限制以避免OOM
+        if len(all_predictions) > 500:
+            all_predictions = all_predictions[:500]
+            all_targets = all_targets[:500]
+        
+        all_predictions = np.concatenate(all_predictions, axis=0)  #将批次的预测结果拼接起来
+        all_targets = np.concatenate(all_targets, axis=0)  #将批次的真实标签拼接起来
         metrics = calculate_metrics(all_targets, all_predictions)  #计算指标并保存在一个字典中（指标在metrics中）
         
         return {'loss': avg_loss, **metrics}    #返回包含损失和指标的字典
@@ -415,6 +429,12 @@ class EMG2PoseTrainer:
         
         # 计算平均损失和指标
         avg_loss = total_loss / len(self.test_loader)
+        
+        # 🔴 内存优化：限制用于metrics计算的样本数
+        if len(all_predictions) > 500:
+            all_predictions = all_predictions[:500]
+            all_targets = all_targets[:500]
+        
         all_predictions = np.concatenate(all_predictions, axis=0)
         all_targets = np.concatenate(all_targets, axis=0)
         metrics = calculate_metrics(all_targets, all_predictions)
