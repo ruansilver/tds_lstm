@@ -1,0 +1,77 @@
+# 快速演示配置 - 用于快速验证和调试
+# 使用最小配置，快速训练
+
+# 数据配置
+data:
+  dataset_path: "D:/Dataset/emg2pose_dataset_mini"
+  hdf5_group: "emg2pose"
+  table_name: "timeseries"
+  stride: 2                                        # 增加步长以减少数据量
+    
+  emg_channels: 16
+  joint_angles_channels: 20
+  window_size: 500
+  
+  split_ratio: [0.7, 0.15, 0.15]
+  normalize: false
+  shuffle: true
+
+# 模型配置 - 最小配置
+model:
+  input_size: 16
+  output_size: 20
+  dropout: 0.1
+  
+  # 简化的TDS编码器 - 只有一个stage
+  tds_stages:
+    - in_conv_kernel: 5
+      in_conv_stride: 4          # 更大的步长，快速降采样
+      num_blocks: 1              # 减少块数量
+      channels: 4                # 减少分组数
+      feature_width: 4
+      kernel_width: 11           # 较小的卷积核
+  
+  # 简化的LSTM解码器
+  decoder_type: "sequential_lstm"
+  decoder_hidden_size: 64                          # 减小隐藏层
+  decoder_num_layers: 1                            # 单层LSTM
+  decoder_state_condition: true
+  
+  predict_velocity: false
+  rollout_freq: 50
+  original_sampling_rate: 2000
+
+# 训练配置 - 快速训练
+training:
+  num_epochs: 10                                   # 只训练10轮
+  batch_size: 32                                   # 较小的批次
+  learning_rate: 0.001                             # 较高的学习率
+  weight_decay: 0.001
+  
+  optimizer: "adam"                                # 使用Adam而非AdamW
+  scheduler: "none"                                # 不使用调度器
+  
+  loss_type: "mse"                                 # 简单的MSE损失
+  mae_weight: 0.5
+  
+  warmup_epochs: 0                                 # 不使用warmup
+  gradient_clip_norm: 1.0
+  gradient_accumulation_steps: 1
+  
+  early_stopping: false                            # 不使用早停
+  patience: 10
+  min_delta: 0.001
+  
+  device: "auto"
+  num_workers: 2                                   # 减少工作进程
+  pin_memory: true
+
+# 日志配置
+logging:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  save_every: 2                                    # 更频繁地保存
+  log_every: 5
+  save_best_only: true
+  monitor: "val_loss"
+  mode: "min"

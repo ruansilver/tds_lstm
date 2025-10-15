@@ -1,0 +1,89 @@
+# 高性能配置 - 追求最佳性能
+# 使用更大的模型和更长的训练时间
+
+# 数据配置
+data:
+  dataset_path: "D:/Dataset/emg2pose_dataset_mini"
+  hdf5_group: "emg2pose"
+  table_name: "timeseries"
+  stride: 1                                        # 最小步长，使用所有数据
+  
+  emg_channels: 16
+  joint_angles_channels: 20
+  window_size: 500
+  
+  split_ratio: [0.7, 0.15, 0.15]
+  normalize: false
+  shuffle: true
+
+# 模型配置 - 更大更深的模型
+model:
+  input_size: 16
+  output_size: 20
+  dropout: 0.1
+  
+  # 更深的TDS编码器 - 3个stage（修复kernel大小问题）
+  tds_stages:
+    - in_conv_kernel: 7          # 第一阶段
+      in_conv_stride: 2
+      num_blocks: 2              # 块数量
+      channels: 8                # 分组数
+      feature_width: 8           # 每组宽度，总特征=8*8=64
+      kernel_width: 21           # 时间卷积核
+    - in_conv_kernel: 5          # 第二阶段
+      in_conv_stride: 2
+      num_blocks: 2
+      channels: 8
+      feature_width: 8           # 保持64特征
+      kernel_width: 11           # 较小的卷积核
+    - in_conv_kernel: 3          # 第三阶段
+      in_conv_stride: 2
+      num_blocks: 2
+      channels: 8
+      feature_width: 8           # 保持64特征
+      kernel_width: 7            # 更小的卷积核，避免维度问题
+  
+  # 更强大的LSTM解码器
+  decoder_type: "sequential_lstm"
+  decoder_hidden_size: 256                         # 增大隐藏层
+  decoder_num_layers: 3                            # 增加层数
+  decoder_state_condition: true
+  
+  predict_velocity: false
+  rollout_freq: 50
+  original_sampling_rate: 2000
+
+# 训练配置 - 长时间训练
+training:
+  num_epochs: 200                                  # 更多训练轮数
+  batch_size: 128                                  # 更大的批次（需要更多GPU内存）
+  learning_rate: 0.0003                            # 较低的初始学习率
+  weight_decay: 0.02                               # 更强的正则化
+  
+  optimizer: "adamw"
+  scheduler: "cosine"                              # Cosine调度器，平滑衰减
+  
+  loss_type: "mse+mae"                             # 组合损失
+  mae_weight: 0.5
+  
+  warmup_epochs: 10                                # 更长的warmup
+  gradient_clip_norm: 1.0
+  gradient_accumulation_steps: 1
+  
+  early_stopping: true
+  patience: 30                                     # 更大的耐心值
+  min_delta: 0.00005                               # 更小的改进阈值
+  
+  device: "auto"
+  num_workers: 8                                   # 更多工作进程
+  pin_memory: true
+
+# 日志配置
+logging:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  save_every: 10                                   # 较少频率保存
+  log_every: 20
+  save_best_only: true
+  monitor: "val_loss"
+  mode: "min"

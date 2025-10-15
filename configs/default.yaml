@@ -1,0 +1,105 @@
+# TDS-LSTM模型标准配置文件
+# 使用优化后的TDS网络和LSTM解码器
+
+# 数据配置
+data:
+  dataset_path: "D:/Dataset/emg2pose_dataset_mini"  # 数据集路径
+  hdf5_group: "emg2pose"                           # HDF5组名
+  table_name: "timeseries"                         # HDF5表名
+  stride: 1                                        # 滑动窗口步长
+  
+  # 数据维度
+  emg_channels: 16                                 # EMG通道数
+  joint_angles_channels: 20                        # 关节角度通道数
+  window_size: 500                                 # 时间窗口大小
+  
+  # 数据分割比例 [train, val, test]
+  split_ratio: [0.7, 0.15, 0.15]
+  
+  # 数据预处理
+  normalize: false                                 # 是否标准化数据
+  shuffle: true                                    # 是否打乱数据
+
+# 模型配置
+model:
+  # 基础参数
+  input_size: 16                                   # EMG通道数（输入维度）
+  output_size: 20                                  # 关节角度通道数（输出维度）
+  dropout: 0.1                                     # Dropout率（降低以利用TDS的正则化）
+  
+  # TDS编码器配置
+  # 每个stage包含: in_conv_kernel, in_conv_stride, num_blocks, channels, feature_width, kernel_width
+  tds_stages:
+    - in_conv_kernel: 5          # 初始卷积核大小
+      in_conv_stride: 2          # 步长（降采样2x）
+      num_blocks: 2              # TDS块数量
+      channels: 8                # 分组数
+      feature_width: 4           # 每组宽度
+      kernel_width: 21           # 时间卷积核宽度（捕获长期依赖）
+    - in_conv_kernel: 5          # 第二阶段
+      in_conv_stride: 2          # 再次降采样2x
+      num_blocks: 2              # TDS块数量
+      channels: 8                # 分组数
+      feature_width: 8           # 增加特征宽度
+      kernel_width: 11           # 较小的卷积核
+  
+  # LSTM解码器配置
+  decoder_type: "sequential_lstm"                  # 解码器类型: "sequential_lstm" 或 "mlp"
+  decoder_hidden_size: 128                         # LSTM隐藏层大小
+  decoder_num_layers: 2                            # LSTM层数
+  decoder_state_condition: true                    # 是否使用状态条件（自回归）
+  
+  # 预测设置
+  predict_velocity: false                          # 预测位置（而非速度）
+  rollout_freq: 50                                 # 解码频率(Hz)，降低计算量
+  original_sampling_rate: 2000                     # EMG原始采样率(Hz)
+
+# 训练配置
+training:
+  # 基础训练参数
+  num_epochs: 100                                  # 训练轮数（增加以充分训练）
+  batch_size: 64                                   # 批次大小（增大以提高稳定性）
+  learning_rate: 0.0005                            # 学习率（降低初始学习率）
+  weight_decay: 0.01                               # 权重衰减（增加正则化）
+  
+  # 优化器和调度器
+  optimizer: "adamw"                               # 优化器: adamw（更好的正则化）
+  scheduler: "cosine"                              # 调度器: cosine（平滑衰减）
+  step_size: 30                                    # StepLR步长（如果使用step调度器）
+  gamma: 0.5                                       # StepLR衰减因子
+  
+  # 损失函数配置
+  loss_type: "mse+mae"                             # 组合损失: "mse", "mae", "mse+mae"
+  mae_weight: 0.5                                  # MAE损失权重
+  
+  # 学习率调度器配置
+  warmup_epochs: 5                                 # Warmup轮数
+  
+  # 梯度相关
+  gradient_clip_norm: 1.0                          # 梯度裁剪范数
+  gradient_accumulation_steps: 1                   # 梯度累积步数
+  
+  # 早停参数
+  early_stopping: true                             # 是否启用早停
+  patience: 20                                     # 早停耐心值（增加）
+  min_delta: 0.0001                                # 最小改进幅度
+  
+  # 设备配置
+  device: "auto"                                   # 训练设备: cpu, cuda, auto
+  num_workers: 4                                   # 数据加载工作进程数
+  pin_memory: true                                 # 是否启用内存锁定
+
+# 日志和保存配置
+logging:
+  # 保存路径
+  checkpoint_dir: "checkpoints"                    # 检查点保存目录
+  log_dir: "logs"                                  # 日志目录
+  
+  # 保存频率
+  save_every: 5                                    # 每N个epoch保存一次
+  log_every: 10                                    # 每N个batch记录一次
+  
+  # 模型保存
+  save_best_only: true                             # 只保存验证集上表现最好的模型
+  monitor: "val_loss"                              # 监控指标
+  mode: "min"                                      # 监控模式: min或max
