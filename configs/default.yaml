@@ -11,7 +11,7 @@ data:
   # 数据维度
   emg_channels: 16                                 # EMG通道数
   joint_angles_channels: 20                        # 关节角度通道数
-  window_size: 500                                 # 时间窗口大小
+  window_size: 1000                                # 时间窗口大小
   
   # 数据分割比例 [train, val, test]
   split_ratio: [0.7, 0.15, 0.15]
