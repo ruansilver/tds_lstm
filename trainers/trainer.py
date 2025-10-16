@@ -453,11 +453,12 @@ class EMG2PoseTrainer:
                 # 获取监控指标的值
                 monitor_value = self._get_monitor_value(val_results)
                 
+                # 调用早停（传入正确的参数）
                 self.early_stopping(
                     current_value=monitor_value,
-                    current_epoch=epoch,
-                    model=self.model
+                    model_weights=self.model.state_dict()
                 )
+                
                 if self.early_stopping.should_stop():
                     logger.info(f"🛑 早停触发，在第 {epoch} 轮停止训练")
                     logger.info(f"📊 监控指标: {self.monitor_metric}")

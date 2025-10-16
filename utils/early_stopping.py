@@ -147,6 +147,58 @@ class EarlyStopping:
             'stopped_epoch': self.stopped_epoch,
             'stop_training': self.stop_training
         }
+    
+    def restore_best_model(self, model) -> bool:
+        """
+        恢复最佳模型权重
+        
+        Args:
+            model: 要恢复的模型
+            
+        Returns:
+            是否成功恢复
+        """
+        if self.best_weights is not None:
+            try:
+                model.load_state_dict(self.best_weights)
+                if self.verbose:
+                    logger.info(f"✅ 已恢复最佳模型权重（指标值: {self.best_value:.6f}）")
+                return True
+            except Exception as e:
+                logger.error(f"❌ 恢复最佳权重失败: {str(e)}")
+                return False
+        else:
+            logger.warning("⚠️  没有保存的最佳权重")
+            return False
+    
+    def summary(self) -> str:
+        """
+        生成早停机制的总结报告
+        
+        Returns:
+            总结文本
+        """
+        lines = [
+            "=" * 60,
+            "早停机制总结",
+            "=" * 60,
+            f"配置:",
+            f"  - 耐心: {self.patience} epochs",
+            f"  - 最小改善: {self.min_delta}",
+            f"  - 模式: {self.mode}",
+            "",
+            f"结果:",
+            f"  - 是否触发早停: {'是' if self.stop_training else '否'}",
+            f"  - 等待轮数: {self.wait}/{self.patience}",
+            f"  - 最佳指标值: {self.best_value:.6f}",
+        ]
+        
+        if self.stop_training:
+            lines.append(f"  - 停止于第 {self.stopped_epoch} 轮")
+        
+        lines.append("=" * 60)
+        
+        return "\n".join(lines)
 
 
 class ReduceLROnPlateau:
