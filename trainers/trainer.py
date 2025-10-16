@@ -71,11 +71,23 @@ class EMG2PoseTrainer:
         self.warmup_scheduler = self._create_warmup_scheduler() if config.training.warmup_epochs > 0 else None
         
         # 早停机制
-        self.early_stopping = EarlyStopping(
-            patience=config.training.patience,
-            min_delta=config.training.min_delta,
-            mode='min'
-        ) if config.training.early_stopping else None
+        if config.training.early_stopping:
+            # 确定监控模式（min还是max）
+            monitor_metric = getattr(config.training, 'monitor_metric', 'val_loss')
+            # 对于损失和误差类指标使用min，对于精度类指标使用max
+            mode = 'max' if 'acc' in monitor_metric.lower() or 'precision' in monitor_metric.lower() else 'min'
+            
+            self.early_stopping = EarlyStopping(
+                patience=config.training.patience,
+                min_delta=config.training.min_delta,
+                mode=mode,
+                restore_best_weights=getattr(config.training, 'restore_best_weights', True),
+                verbose=True
+            )
+            self.monitor_metric = monitor_metric
+        else:
+            self.early_stopping = None
+            self.monitor_metric = None
         
         # 检查点管理器
         self.checkpoint_manager = CheckpointManager(
@@ -194,11 +206,22 @@ class EMG2PoseTrainer:
         return optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=warmup_lambda)
     
     def train_epoch(self) -> Dict[str, float]:   
-        """训练一个epoch"""
+        """训练一个epoch（内存优化版本）"""
         self.model.train()  # 设置模型为训练模式
         total_loss = 0.0   # 累计损失
-        all_predictions = []   # 预测结果
-        all_targets = []  # 真实标签
+        
+        # 内存优化：在线计算metrics，不存储所有预测
+        compute_metrics_online = getattr(self.config.training, 'compute_metrics_online', True)
+        
+        if compute_metrics_online:
+            # 在线统计量
+            num_samples = 0
+            sum_squared_error = 0.0
+            sum_absolute_error = 0.0
+        else:
+            # 传统方式：收集样本（仅用于小数据集）
+            all_predictions = []
+            all_targets = []
         
         # 梯度累积步数
         accumulation_steps = getattr(self.config.training, 'gradient_accumulation_steps', 1)
@@ -209,14 +232,14 @@ class EMG2PoseTrainer:
             angle_data = angle_data.to(self.device)
             
             # 前向传播
-            predictions = self.model(emg_data)  # 2. 前向传播
-            loss = self.criterion(predictions, angle_data) # 3. 计算损失
+            predictions = self.model(emg_data)
+            loss = self.criterion(predictions, angle_data)
             
             # 梯度累积：损失需要除以累积步数
             loss = loss / accumulation_steps
             
             # 反向传播
-            loss.backward()     # 4. 反向传播计算梯度
+            loss.backward()
             
             # 每accumulation_steps步或最后一步才更新参数
             if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(self.train_loader):
@@ -225,54 +248,90 @@ class EMG2PoseTrainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
                 
                 # 优化器步骤
-                self.optimizer.step()  # 5. 优化器更新参数
-                self.optimizer.zero_grad()    # 6. 清零梯度
+                self.optimizer.step()
+                self.optimizer.zero_grad()
             
-            # 统计（使用原始loss，不是除以accumulation_steps后的）
+            # 统计损失（使用原始loss，不是除以accumulation_steps后的）
             total_loss += loss.item() * accumulation_steps
-            all_predictions.append(predictions.detach().cpu().numpy())
-            all_targets.append(angle_data.detach().cpu().numpy())
+            
+            # 在线计算metrics（内存友好）
+            if compute_metrics_online:
+                with torch.no_grad():
+                    batch_size = predictions.shape[0]
+                    num_samples += batch_size * predictions.shape[1]
+                    
+                    # 计算误差统计量
+                    squared_error = ((predictions - angle_data) ** 2).sum().item()
+                    absolute_error = torch.abs(predictions - angle_data).sum().item()
+                    
+                    sum_squared_error += squared_error
+                    sum_absolute_error += absolute_error
+            else:
+                # 传统方式：收集样本
+                all_predictions.append(predictions.detach().cpu().numpy())
+                all_targets.append(angle_data.detach().cpu().numpy())
             
             # 内存清理：及时释放不需要的tensor
-            del emg_data, angle_data, predictions
-            if batch_idx % 100 == 0:
+            del emg_data, angle_data, predictions, loss
+            
+            # 更激进的内存清理
+            if batch_idx % 50 == 0:
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
             
-            # 日志记录   使用tensorboard记录训练过程
+            # 日志记录
             if batch_idx % self.config.logging.log_every == 0:
+                current_loss = total_loss / (batch_idx + 1)
                 if self.writer:
-                    self.writer.add_scalar('Train/BatchLoss', loss.item(), self.global_step)
+                    self.writer.add_scalar('Train/BatchLoss', current_loss, self.global_step)
                     self.writer.add_scalar('Train/LearningRate', 
                                          self.optimizer.param_groups[0]['lr'], self.global_step)
                 
                 logger.info(f'Epoch: {self.current_epoch}, Batch: {batch_idx}/{len(self.train_loader)}, '
-                           f'Loss: {loss.item():.6f}')
+                           f'Loss: {current_loss:.6f}')
             
             self.global_step += 1
         
         # 计算epoch平均损失和指标
-        avg_loss = total_loss / len(self.train_loader)      #平均损失
+        avg_loss = total_loss / len(self.train_loader)
         
-        # 🔴 内存优化：分批计算metrics，避免大数组拼接
-        # 只在前1000个batch上计算metrics（代表性足够）
-        if len(all_predictions) > 1000:
-            all_predictions = all_predictions[:1000]
-            all_targets = all_targets[:1000]
-        
-        all_predictions = np.concatenate(all_predictions, axis=0) #将批次的预测结果拼接起来
-        all_targets = np.concatenate(all_targets, axis=0) #将批次的真实标签拼接起来
-        metrics = calculate_metrics(all_targets, all_predictions) #计算指标
+        # 计算metrics
+        if compute_metrics_online:
+            # 从在线统计量计算metrics
+            metrics = {
+                'mse': sum_squared_error / num_samples,
+                'mae': sum_absolute_error / num_samples,
+                'rmse': np.sqrt(sum_squared_error / num_samples)
+            }
+        else:
+            # 传统方式：从收集的样本计算
+            # 内存优化：限制样本数
+            if len(all_predictions) > 1000:
+                all_predictions = all_predictions[:1000]
+                all_targets = all_targets[:1000]
+            
+            all_predictions = np.concatenate(all_predictions, axis=0)
+            all_targets = np.concatenate(all_targets, axis=0)
+            metrics = calculate_metrics(all_targets, all_predictions)
         
         return {'loss': avg_loss, **metrics}
     
     def validate_epoch(self) -> Dict[str, float]:
-        """验证一个epoch"""
-        self.model.eval() # 设置模型为评估模式
-        total_loss = 0.0 # 累计损失
-        all_predictions = []
-        all_targets = []
+        """验证一个epoch（内存优化版本）"""
+        self.model.eval()
+        total_loss = 0.0
         
-        with torch.no_grad(): # 禁用梯度计算
+        # 内存优化：在线计算metrics
+        compute_metrics_online = getattr(self.config.training, 'compute_metrics_online', True)
+        
+        if compute_metrics_online:
+            num_samples = 0
+            sum_squared_error = 0.0
+            sum_absolute_error = 0.0
+        else:
+            all_predictions = []
+            all_targets = []
+        
+        with torch.no_grad():
             for batch_idx, (emg_data, angle_data) in enumerate(self.val_loader):
                 # 数据移到设备
                 emg_data = emg_data.to(self.device)
@@ -282,30 +341,49 @@ class EMG2PoseTrainer:
                 predictions = self.model(emg_data)
                 loss = self.criterion(predictions, angle_data)
                 
-                # 统计
+                # 统计损失
                 total_loss += loss.item()
-                all_predictions.append(predictions.cpu().numpy())
-                all_targets.append(angle_data.cpu().numpy())
+                
+                # 在线计算metrics
+                if compute_metrics_online:
+                    batch_size = predictions.shape[0]
+                    num_samples += batch_size * predictions.shape[1]
+                    
+                    squared_error = ((predictions - angle_data) ** 2).sum().item()
+                    absolute_error = torch.abs(predictions - angle_data).sum().item()
+                    
+                    sum_squared_error += squared_error
+                    sum_absolute_error += absolute_error
+                else:
+                    all_predictions.append(predictions.cpu().numpy())
+                    all_targets.append(angle_data.cpu().numpy())
                 
                 # 内存清理
-                del emg_data, angle_data, predictions
+                del emg_data, angle_data, predictions, loss
+                
                 if batch_idx % 50 == 0:
                     torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
-        # 计算epoch平均损失和指标
+        # 计算平均损失和指标
         avg_loss = total_loss / len(self.val_loader)
         
-        # 🔴 内存优化：限制用于metrics计算的样本数
-        # 验证集通常较小，但仍需要限制以避免OOM
-        if len(all_predictions) > 500:
-            all_predictions = all_predictions[:500]
-            all_targets = all_targets[:500]
+        if compute_metrics_online:
+            metrics = {
+                'mse': sum_squared_error / num_samples,
+                'mae': sum_absolute_error / num_samples,
+                'rmse': np.sqrt(sum_squared_error / num_samples)
+            }
+        else:
+            # 内存优化：限制样本数
+            if len(all_predictions) > 500:
+                all_predictions = all_predictions[:500]
+                all_targets = all_targets[:500]
+            
+            all_predictions = np.concatenate(all_predictions, axis=0)
+            all_targets = np.concatenate(all_targets, axis=0)
+            metrics = calculate_metrics(all_targets, all_predictions)
         
-        all_predictions = np.concatenate(all_predictions, axis=0)  #将批次的预测结果拼接起来
-        all_targets = np.concatenate(all_targets, axis=0)  #将批次的真实标签拼接起来
-        metrics = calculate_metrics(all_targets, all_predictions)  #计算指标并保存在一个字典中（指标在metrics中）
-        
-        return {'loss': avg_loss, **metrics}    #返回包含损失和指标的字典
+        return {'loss': avg_loss, **metrics}
     
     def train(self) -> Dict[str, Any]:
         """执行完整的训练过程"""
@@ -372,9 +450,30 @@ class EMG2PoseTrainer:
             
             # 早停检查
             if self.early_stopping:
-                self.early_stopping(val_results['loss'])
+                # 获取监控指标的值
+                monitor_value = self._get_monitor_value(val_results)
+                
+                self.early_stopping(
+                    current_value=monitor_value,
+                    current_epoch=epoch,
+                    model=self.model
+                )
                 if self.early_stopping.should_stop():
-                    logger.info(f"早停触发，在第 {epoch} 轮停止训练")
+                    logger.info(f"🛑 早停触发，在第 {epoch} 轮停止训练")
+                    logger.info(f"📊 监控指标: {self.monitor_metric}")
+                    
+                    # 恢复最佳模型权重
+                    if self.early_stopping.restore_best_weights:
+                        if self.early_stopping.restore_best_model(self.model):
+                            logger.info(f"✅ 已将模型恢复到最佳状态")
+                            # 使用最佳权重重新计算验证指标
+                            val_results = self.validate_epoch()
+                            logger.info(f"📈 最佳模型验证结果 - Loss: {val_results['loss']:.6f}, MSE: {val_results.get('mse', 0):.6f}")
+                        else:
+                            logger.warning(f"⚠️  无法恢复最佳模型权重")
+                    
+                    # 打印早停摘要
+                    logger.info("\n" + self.early_stopping.summary())
                     break
             
             # 打印epoch结果
@@ -386,21 +485,32 @@ class EMG2PoseTrainer:
                        f'Val MSE: {val_results.get("mse", 0):.6f}')
         
         total_time = time.time() - start_time
-        logger.info(f"训练完成，总用时: {total_time:.2f}秒")
+        logger.info(f"✅ 训练完成，总用时: {total_time:.2f}秒")
+        
+        # 如果没有触发早停，打印早停机制的摘要
+        if self.early_stopping and not self.early_stopping.should_stop():
+            logger.info("\n" + self.early_stopping.summary())
         
         # 关闭TensorBoard写入器
         if self.writer:
             self.writer.close()
         
-        return {
+        # 返回训练结果
+        result = {
             'train_history': self.train_history,
             'val_history': self.val_history,
             'best_val_loss': self.best_val_loss,
             'total_time': total_time
         }
+        
+        # 添加早停信息
+        if self.early_stopping:
+            result['early_stopping_info'] = self.early_stopping.get_info()
+        
+        return result
     
     def evaluate(self) -> Dict[str, float]:
-        """在测试集上评估模型"""
+        """在测试集上评估模型（内存优化版本）"""
         if self.test_loader is None:
             logger.warning("没有提供测试数据加载器")
             return {}
@@ -409,11 +519,20 @@ class EMG2PoseTrainer:
         
         self.model.eval()
         total_loss = 0.0
-        all_predictions = []
-        all_targets = []
+        
+        # 内存优化：在线计算metrics
+        compute_metrics_online = getattr(self.config.training, 'compute_metrics_online', True)
+        
+        if compute_metrics_online:
+            num_samples = 0
+            sum_squared_error = 0.0
+            sum_absolute_error = 0.0
+        else:
+            all_predictions = []
+            all_targets = []
         
         with torch.no_grad():
-            for emg_data, angle_data in self.test_loader:
+            for batch_idx, (emg_data, angle_data) in enumerate(self.test_loader):
                 # 数据移到设备
                 emg_data = emg_data.to(self.device)
                 angle_data = angle_data.to(self.device)
@@ -422,22 +541,47 @@ class EMG2PoseTrainer:
                 predictions = self.model(emg_data)
                 loss = self.criterion(predictions, angle_data)
                 
-                # 统计
+                # 统计损失
                 total_loss += loss.item()
-                all_predictions.append(predictions.cpu().numpy())
-                all_targets.append(angle_data.cpu().numpy())
+                
+                # 在线计算metrics
+                if compute_metrics_online:
+                    batch_size = predictions.shape[0]
+                    num_samples += batch_size * predictions.shape[1]
+                    
+                    squared_error = ((predictions - angle_data) ** 2).sum().item()
+                    absolute_error = torch.abs(predictions - angle_data).sum().item()
+                    
+                    sum_squared_error += squared_error
+                    sum_absolute_error += absolute_error
+                else:
+                    all_predictions.append(predictions.cpu().numpy())
+                    all_targets.append(angle_data.cpu().numpy())
+                
+                # 内存清理
+                del emg_data, angle_data, predictions, loss
+                
+                if batch_idx % 50 == 0:
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
         # 计算平均损失和指标
         avg_loss = total_loss / len(self.test_loader)
         
-        # 🔴 内存优化：限制用于metrics计算的样本数
-        if len(all_predictions) > 500:
-            all_predictions = all_predictions[:500]
-            all_targets = all_targets[:500]
-        
-        all_predictions = np.concatenate(all_predictions, axis=0)
-        all_targets = np.concatenate(all_targets, axis=0)
-        metrics = calculate_metrics(all_targets, all_predictions)
+        if compute_metrics_online:
+            metrics = {
+                'mse': sum_squared_error / num_samples,
+                'mae': sum_absolute_error / num_samples,
+                'rmse': np.sqrt(sum_squared_error / num_samples)
+            }
+        else:
+            # 内存优化：限制样本数
+            if len(all_predictions) > 500:
+                all_predictions = all_predictions[:500]
+                all_targets = all_targets[:500]
+            
+            all_predictions = np.concatenate(all_predictions, axis=0)
+            all_targets = np.concatenate(all_targets, axis=0)
+            metrics = calculate_metrics(all_targets, all_predictions)
         
         test_results = {'loss': avg_loss, **metrics}
         
@@ -446,3 +590,26 @@ class EMG2PoseTrainer:
             logger.info(f"  {metric_name}: {metric_value:.6f}")
         
         return test_results
+    
+    def _get_monitor_value(self, results: Dict[str, float]) -> float:
+        """
+        从结果字典中获取监控指标的值
+        
+        Args:
+            results: 包含各种指标的结果字典
+            
+        Returns:
+            监控指标的值
+        """
+        if self.monitor_metric is None:
+            return results.get('loss', float('inf'))
+        
+        # 去除val_前缀（如果有）
+        metric_key = self.monitor_metric.replace('val_', '')
+        
+        # 尝试获取指标值
+        if metric_key in results:
+            return results[metric_key]
+        else:
+            logger.warning(f"⚠️  监控指标 '{self.monitor_metric}' 未找到，使用 'loss' 代替")
+            return results.get('loss', float('inf'))

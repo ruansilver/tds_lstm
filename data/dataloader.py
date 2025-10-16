@@ -1,5 +1,5 @@
 """
-数据加载器创建和管理
+数据加载器创建和管理（内存优化版本）
 """
 
 import logging
@@ -7,14 +7,20 @@ from typing import Tuple, List
 from torch.utils.data import DataLoader, random_split
 from sklearn.model_selection import train_test_split
 
-from .dataset import EMG2PoseDataset, load_hdf5_files
+from .dataset import TimeSeriesDataset, load_hdf5_files
 from config import Config
 
 logger = logging.getLogger(__name__)
 
+
 def create_dataloaders(config: Config) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
-    创建训练、验证和测试数据加载器
+    创建训练、验证和测试数据加载器（内存优化版本）
+    
+    优化点：
+    - 使用persistent_workers避免每个epoch重建workers
+    - 配置prefetch_factor控制预取数据量
+    - 根据配置动态调整pin_memory
     
     Args:
         config: 配置对象
@@ -29,19 +35,17 @@ def create_dataloaders(config: Config) -> Tuple[DataLoader, DataLoader, DataLoad
         raise ValueError(f"在路径 {config.data.dataset_path} 中没有找到HDF5文件")
     
     # 按文件分割数据集，确保同一文件的数据不会同时出现在训练和测试集中
-    #这里没有用random_split，因为它只能分成两部分      而且random_split是按样本数分割的，不是按文件分割的
-    # 我们需要分成三部分：训练集、验证集、测试集 
     train_files, temp_files = train_test_split(
         hdf5_files, 
         test_size=1-config.data.split_ratio[0], 
-        random_state=42     #设置随机种子，保证每次分割结果一致
+        random_state=42
     )
     
     val_size = config.data.split_ratio[1] / (config.data.split_ratio[1] + config.data.split_ratio[2])
     val_files, test_files = train_test_split(
-        temp_files,    # 剩余的30%数据
-        test_size=1-val_size,   # 0.5
-        random_state=42  # 保持和上次分割一致的随机种子
+        temp_files,
+        test_size=1-val_size,
+        random_state=42
     )
     
     logger.info(f"数据集分割:")
@@ -49,32 +53,42 @@ def create_dataloaders(config: Config) -> Tuple[DataLoader, DataLoader, DataLoad
     logger.info(f"  验证文件数: {len(val_files)}")
     logger.info(f"  测试文件数: {len(test_files)}")
     
-    # 创建数据集
-    train_dataset = EMG2PoseDataset(
+    # 获取内存优化配置
+    max_samples_for_normalize = getattr(config.data, 'max_samples_for_normalize', 10000)
+    chunk_cache_size = getattr(config.data, 'chunk_cache_size', 64 * 1024 * 1024)
+    
+    # 创建数据集（使用优化的TimeSeriesDataset）
+    train_dataset = TimeSeriesDataset(
         hdf5_files=train_files,
         window_size=config.data.window_size,
         hdf5_group=config.data.hdf5_group,
         table_name=config.data.table_name,
         normalize=config.data.normalize,
-        stride=config.data.stride
+        stride=config.data.stride,
+        max_samples_for_normalize=max_samples_for_normalize,
+        chunk_cache_size=chunk_cache_size
     )
     
-    val_dataset = EMG2PoseDataset(
+    val_dataset = TimeSeriesDataset(
         hdf5_files=val_files,
         window_size=config.data.window_size,
         hdf5_group=config.data.hdf5_group,
         table_name=config.data.table_name,
         normalize=config.data.normalize,
-        stride=config.data.stride
+        stride=config.data.stride,
+        max_samples_for_normalize=max_samples_for_normalize,
+        chunk_cache_size=chunk_cache_size
     )
     
-    test_dataset = EMG2PoseDataset(
+    test_dataset = TimeSeriesDataset(
         hdf5_files=test_files,
         window_size=config.data.window_size,
         hdf5_group=config.data.hdf5_group,
         table_name=config.data.table_name,
         normalize=config.data.normalize,
-        stride=config.data.stride
+        stride=config.data.stride,
+        max_samples_for_normalize=max_samples_for_normalize,
+        chunk_cache_size=chunk_cache_size
     )
     
     logger.info(f"数据集样本数:")
@@ -82,32 +96,50 @@ def create_dataloaders(config: Config) -> Tuple[DataLoader, DataLoader, DataLoad
     logger.info(f"  验证样本: {len(val_dataset)}")
     logger.info(f"  测试样本: {len(test_dataset)}")
     
-    # 创建数据加载器
+    # 获取DataLoader优化配置
+    num_workers = config.training.num_workers
+    pin_memory = config.training.pin_memory
+    persistent_workers = getattr(config.training, 'persistent_workers', True) if num_workers > 0 else False
+    prefetch_factor = getattr(config.training, 'prefetch_factor', 2) if num_workers > 0 else None
+    
+    logger.info(f"DataLoader配置:")
+    logger.info(f"  num_workers: {num_workers}")
+    logger.info(f"  pin_memory: {pin_memory}")
+    logger.info(f"  persistent_workers: {persistent_workers}")
+    logger.info(f"  prefetch_factor: {prefetch_factor}")
+    
+    # 创建数据加载器（内存优化配置）
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.training.batch_size,
         shuffle=config.data.shuffle,
-        num_workers=config.training.num_workers,
-        pin_memory=config.training.pin_memory,
-        drop_last=True
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=True,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.training.batch_size,
         shuffle=False,
-        num_workers=config.training.num_workers,
-        pin_memory=config.training.pin_memory,
-        drop_last=False
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor
     )
     
     test_loader = DataLoader(
         test_dataset,
         batch_size=config.training.batch_size,
         shuffle=False,
-        num_workers=config.training.num_workers,
-        pin_memory=config.training.pin_memory,
-        drop_last=False
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor
     )
     
     return train_loader, val_loader, test_loader

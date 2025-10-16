@@ -15,6 +15,10 @@ data:
   split_ratio: [0.7, 0.15, 0.15]
   normalize: false
   shuffle: true
+  
+  # 内存优化配置
+  max_samples_for_normalize: 20000                 # 更多采样（更准确的统计）
+  chunk_cache_size: 134217728                      # 更大的cache（128MB）
 
 # 模型配置 - 更大更深的模型
 model:
@@ -73,10 +77,17 @@ training:
   early_stopping: true
   patience: 30                                     # 更大的耐心值
   min_delta: 0.00005                               # 更小的改进阈值
+  monitor_metric: "val_loss"                       # 也可以使用val_mse或val_mae
+  restore_best_weights: true                       # 早停时恢复最佳权重
   
   device: "auto"
   num_workers: 8                                   # 更多工作进程
   pin_memory: true
+  
+  # 内存优化配置
+  persistent_workers: true                         # worker持久化
+  prefetch_factor: 4                               # 更多预取（充分利用I/O）
+  compute_metrics_online: true                     # 在线计算metrics
 
 # 日志配置
 logging:

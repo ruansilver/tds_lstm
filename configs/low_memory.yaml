@@ -15,6 +15,10 @@ data:
   split_ratio: [0.7, 0.15, 0.15]
   normalize: false
   shuffle: true
+  
+  # 内存优化配置
+  max_samples_for_normalize: 5000                  # 🔴 更少的采样数（节省内存）
+  chunk_cache_size: 33554432                       # 🔴 更小的cache（32MB）
 
 # 模型配置 - 中等大小
 model:
@@ -71,6 +75,11 @@ training:
   device: "auto"
   num_workers: 2                                   # 🔴 减少工作进程（从4降到2）
   pin_memory: false                                # 🔴 禁用pin_memory节省内存
+  
+  # 内存优化配置
+  persistent_workers: true                         # 保持worker持久化
+  prefetch_factor: 1                               # 🔴 减少预取（节省内存）
+  compute_metrics_online: true                     # 🔴 必须在线计算（节省内存）
 
 # 日志配置
 logging:

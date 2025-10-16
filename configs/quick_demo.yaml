@@ -15,6 +15,10 @@ data:
   split_ratio: [0.7, 0.15, 0.15]
   normalize: false
   shuffle: true
+  
+  # 内存优化配置
+  max_samples_for_normalize: 5000                  # 快速采样
+  chunk_cache_size: 33554432                       # 32MB cache
 
 # 模型配置 - 最小配置
 model:
@@ -58,13 +62,20 @@ training:
   gradient_clip_norm: 1.0
   gradient_accumulation_steps: 1
   
-  early_stopping: false                            # 不使用早停
+  early_stopping: false                            # 不使用早停（快速演示）
   patience: 10
   min_delta: 0.001
+  monitor_metric: "val_loss"
+  restore_best_weights: true
   
   device: "auto"
   num_workers: 2                                   # 减少工作进程
   pin_memory: true
+  
+  # 内存优化配置
+  persistent_workers: false                        # 快速演示不需要持久化
+  prefetch_factor: 2                               # 标准预取
+  compute_metrics_online: true                     # 在线计算
 
 # 日志配置
 logging:

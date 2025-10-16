@@ -19,6 +19,10 @@ data:
   # 数据预处理
   normalize: false                                 # 是否标准化数据
   shuffle: true                                    # 是否打乱数据
+  
+  # 内存优化配置
+  max_samples_for_normalize: 10000                 # 标准化时的最大采样数
+  chunk_cache_size: 67108864                       # HDF5 chunk cache大小（64MB）
 
 # 模型配置
 model:
@@ -83,11 +87,18 @@ training:
   early_stopping: true                             # 是否启用早停
   patience: 20                                     # 早停耐心值（增加）
   min_delta: 0.0001                                # 最小改进幅度
+  monitor_metric: "val_loss"                       # 监控指标: val_loss, val_mse, val_mae等
+  restore_best_weights: true                       # 早停时是否恢复最佳权重
   
   # 设备配置
   device: "auto"                                   # 训练设备: cpu, cuda, auto
   num_workers: 4                                   # 数据加载工作进程数
   pin_memory: true                                 # 是否启用内存锁定
+  
+  # 内存优化配置
+  persistent_workers: true                         # DataLoader worker持久化（避免重建）
+  prefetch_factor: 2                               # 每个worker预取的batch数
+  compute_metrics_online: true                     # 在线计算metrics（避免大数组拼接）
 
 # 日志和保存配置
 logging:

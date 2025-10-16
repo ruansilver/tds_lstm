@@ -1,6 +1,6 @@
 """
-EMG到姿态预测的数据集类
-处理HDF5文件中的时序数据
+数据集类 - 懒加载和内存优化版本
+处理HDF5文件中的时序数据，采用懒加载策略最小化内存占用
 """
 
 import os
@@ -8,16 +8,190 @@ import h5py
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from typing import List, Tuple, Dict, Any
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
+from typing import List, Tuple, Dict, Any, Optional
 import logging
 
 logger = logging.getLogger(__name__)
 
-class EMG2PoseDataset(Dataset):
+
+class SessionData:
     """
-    EMG到姿态预测的数据集类
+    单个HDF5会话的只读接口
+    
+    特点：
+    - 保持HDF5文件打开以提高访问效率
+    - 只加载metadata到内存
+    - 数据直接从磁盘读取（懒加载）
+    - 支持上下文管理器
+    
+    Args:
+        hdf5_path: HDF5文件路径
+        hdf5_group: HDF5组名
+        table_name: 数据表名
+        chunk_cache_size: HDF5 chunk缓存大小（字节）
+    """
+    
+    def __init__(
+        self,
+        hdf5_path: str,
+        hdf5_group: str = "emg2pose",
+        table_name: str = "timeseries",
+        chunk_cache_size: int = 64 * 1024 * 1024  # 64MB
+    ):
+        self.hdf5_path = hdf5_path
+        self.hdf5_group = hdf5_group
+        self.table_name = table_name
+        
+        # 使用chunk cache优化连续读取性能
+        self._file = h5py.File(
+            hdf5_path, 
+            'r', 
+            rdcc_nbytes=chunk_cache_size,
+            rdcc_w0=0.75  # chunk cache权重参数
+        )
+        
+        # 检查数据结构
+        if hdf5_group not in self._file:
+            raise ValueError(f"HDF5文件中未找到组 '{hdf5_group}'")
+        
+        group = self._file[hdf5_group]
+        if table_name not in group:
+            raise ValueError(f"HDF5组中未找到表 '{table_name}'")
+        
+        # 引用数据表（不加载到内存）
+        self.timeseries = group[table_name]
+        self.data_length = len(self.timeseries)
+        
+        # 加载metadata（通常很小）
+        self.metadata = dict(group.attrs.items()) if hasattr(group, 'attrs') else {}
+        
+        # 检测数据字段
+        self.is_structured = hasattr(self.timeseries.dtype, 'names') and self.timeseries.dtype.names
+        if self.is_structured:
+            self.field_names = list(self.timeseries.dtype.names)
+        else:
+            self.field_names = []
+        
+        logger.debug(f"SessionData初始化: {os.path.basename(hdf5_path)}, 长度: {self.data_length}")
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+    
+    def __len__(self):
+        return self.data_length
+    
+    def close(self):
+        """关闭HDF5文件"""
+        if hasattr(self, '_file') and self._file:
+            self._file.close()
+            self._file = None
+    
+    def get_window(self, start_idx: int, end_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        读取指定窗口的数据
+        
+        Args:
+            start_idx: 起始索引
+            end_idx: 结束索引
+            
+        Returns:
+            emg_data: EMG数据 (window_size, 16)
+            angle_data: 关节角度数据 (window_size, 20)
+        """
+        # 从磁盘读取窗口数据（懒加载）
+        window_raw = self.timeseries[start_idx:end_idx]
+        
+        # 根据数据结构解析
+        if self.is_structured:
+            # 结构化数组
+            emg_data = window_raw['emg'].astype(np.float32) if 'emg' in self.field_names else None
+            angle_data = window_raw['joint_angles'].astype(np.float32) if 'joint_angles' in self.field_names else None
+        else:
+            # 非结构化数组：假设前16列是EMG，后20列是关节角度
+            window_data = window_raw.astype(np.float32)
+            if len(window_data.shape) == 2 and window_data.shape[1] >= 36:
+                emg_data = window_data[:, :16]
+                angle_data = window_data[:, 16:36]
+            else:
+                emg_data = None
+                angle_data = None
+        
+        return emg_data, angle_data
+    
+    def compute_statistics_sampled(
+        self, 
+        max_samples: int = 10000
+    ) -> Tuple[Optional[Dict], Optional[Dict]]:
+        """
+        计算标准化统计量（采样版本，内存友好）
+        
+        Args:
+            max_samples: 最大采样数量
+            
+        Returns:
+            emg_stats: EMG统计量 {'mean': array, 'std': array}
+            angle_stats: 角度统计量 {'mean': array, 'std': array}
+        """
+        sample_size = min(max_samples, self.data_length)
+        
+        # 均匀采样索引
+        if sample_size < self.data_length:
+            indices = np.linspace(0, self.data_length - 1, sample_size, dtype=int)
+        else:
+            indices = np.arange(self.data_length)
+        
+        # 读取采样数据
+        sampled = self.timeseries[indices]
+        
+        emg_stats = None
+        angle_stats = None
+        
+        if self.is_structured:
+            if 'emg' in self.field_names:
+                emg_data = sampled['emg'].astype(np.float32)
+                emg_stats = {
+                    'mean': np.mean(emg_data, axis=0),
+                    'std': np.std(emg_data, axis=0) + 1e-8  # 避免除零
+                }
+            
+            if 'joint_angles' in self.field_names:
+                angle_data = sampled['joint_angles'].astype(np.float32)
+                angle_stats = {
+                    'mean': np.mean(angle_data, axis=0),
+                    'std': np.std(angle_data, axis=0) + 1e-8
+                }
+        else:
+            sampled_data = sampled.astype(np.float32)
+            if len(sampled_data.shape) == 2:
+                if sampled_data.shape[1] >= 16:
+                    emg_data = sampled_data[:, :16]
+                    emg_stats = {
+                        'mean': np.mean(emg_data, axis=0),
+                        'std': np.std(emg_data, axis=0) + 1e-8
+                    }
+                
+                if sampled_data.shape[1] >= 36:
+                    angle_data = sampled_data[:, 16:36]
+                    angle_stats = {
+                        'mean': np.mean(angle_data, axis=0),
+                        'std': np.std(angle_data, axis=0) + 1e-8
+                    }
+        
+        return emg_stats, angle_stats
+
+
+class TimeSeriesDataset(Dataset):
+    """
+    时序数据集类（内存优化版本）
+    
+    特点：
+    - 懒加载：数据保留在磁盘，按需读取
+    - 预计算窗口索引：避免在内存中存储实际数据
+    - 采样式标准化：不加载全部数据
+    - 高效的HDF5访问：使用chunk cache
     
     Args:
         hdf5_files: HDF5文件路径列表
@@ -25,17 +199,21 @@ class EMG2PoseDataset(Dataset):
         hdf5_group: HDF5文件中的组名
         table_name: 表名
         normalize: 是否标准化数据
-        stride: 滑动窗口步长，默认为1
+        stride: 滑动窗口步长
+        max_samples_for_normalize: 标准化时的最大采样数
+        chunk_cache_size: HDF5 chunk缓存大小（字节）
     """
     
     def __init__(
-        self,   #接受配置文件的参数，在dataloader.py中传入
-        hdf5_files: List[str],   # HDF5文件路径列表
+        self,
+        hdf5_files: List[str],
         window_size: int = 11750,
         hdf5_group: str = "emg2pose",
         table_name: str = "timeseries",
         normalize: bool = False,
-        stride: int = 1
+        stride: int = 1,
+        max_samples_for_normalize: int = 10000,
+        chunk_cache_size: int = 64 * 1024 * 1024
     ):
         self.hdf5_files = hdf5_files
         self.window_size = window_size
@@ -43,167 +221,96 @@ class EMG2PoseDataset(Dataset):
         self.table_name = table_name
         self.normalize = normalize
         self.stride = stride
+        self.max_samples_for_normalize = max_samples_for_normalize
+        self.chunk_cache_size = chunk_cache_size
         
-        # 存储数据和索引
-        self.data_indices = []  # (file_idx, start_idx) 的列表
-        self.emg_scalers = {}   # 每个文件的EMG标准化器
-        self.angle_scalers = {} # 每个文件的角度标准化器
+        # 窗口索引：存储 (file_idx, start_idx) 元组
+        self.window_indices = []
         
-        # 加载和预处理数据
-        self._load_data()
+        # 标准化统计量（轻量级）
+        self.emg_stats = {}   # {file_idx: {'mean': array, 'std': array}}
+        self.angle_stats = {}
         
-    def _load_data(self):   #这种是类的私有方法，外部不应该调用
-        """加载所有HDF5文件并创建索引"""
+        # 会话数据缓存（用于worker进程）
+        self._sessions = {}
         
-        logger.info(f"开始加载 {len(self.hdf5_files)} 个HDF5文件...")
+        # 预处理：创建索引和计算统计量
+        self._preprocess()
         
-        for file_idx, hdf5_file in enumerate(self.hdf5_files):   # 遍历每个hdf5文件
+        logger.info(f"数据集初始化完成：{len(self.window_indices)} 个样本窗口")
+    
+    def _preprocess(self):
+        """预处理：构建窗口索引并计算标准化统计量"""
+        logger.info(f"开始预处理 {len(self.hdf5_files)} 个HDF5文件...")
+        
+        for file_idx, hdf5_file in enumerate(self.hdf5_files):
             if not os.path.exists(hdf5_file):
-                logger.warning(f"文件不存在: {hdf5_file}")
+                logger.warning(f"文件不存在，跳过: {hdf5_file}")
                 continue
-                
+            
             try:
-                with h5py.File(hdf5_file, 'r') as f:
-                    # 检查数据结构
-                    if self.hdf5_group not in f:
-                        logger.warning(f"文件 {hdf5_file} 中没有找到组 '{self.hdf5_group}'")
-                        continue
-                        
-                    group = f[self.hdf5_group]
-                    if self.table_name not in group:
-                        logger.warning(f"文件 {hdf5_file} 中没有找到表 '{self.table_name}'")
-                        continue
+                # 使用SessionData快速获取元数据
+                with SessionData(
+                    hdf5_file, 
+                    self.hdf5_group, 
+                    self.table_name,
+                    self.chunk_cache_size
+                ) as session:
+                    data_length = len(session)
                     
-                    # 读取数据
-                    table = group[self.table_name]  # 这里的table是一个h5py.Dataset对象
-                    data_length = len(table)
-                    
-                    # 检查数据长度是否足够
+                    # 检查数据长度
                     if data_length < self.window_size:
-                        logger.warning(f"文件 {hdf5_file} 数据长度 {data_length} 小于窗口大小 {self.window_size}")
+                        logger.warning(
+                            f"文件 {os.path.basename(hdf5_file)} 数据长度 {data_length} "
+                            f"小于窗口大小 {self.window_size}，跳过"
+                        )
                         continue
                     
-                    # 创建滑动窗口索引
+                    # 创建窗口索引（不存储实际数据）
                     num_windows = (data_length - self.window_size) // self.stride + 1
                     for i in range(num_windows):
                         start_idx = i * self.stride
-                        self.data_indices.append((file_idx, start_idx))
+                        self.window_indices.append((file_idx, start_idx))
                     
-                    # 如果需要标准化，读取全部数据进行拟合
+                    # 如果需要标准化，计算统计量（采样方式）
                     if self.normalize:
-                        self._fit_scalers(file_idx, table)
-                        
-                    logger.info(f"文件 {hdf5_file} 加载完成，数据长度: {data_length}, 创建窗口数: {num_windows}")
+                        emg_stats, angle_stats = session.compute_statistics_sampled(
+                            self.max_samples_for_normalize
+                        )
+                        if emg_stats:
+                            self.emg_stats[file_idx] = emg_stats
+                        if angle_stats:
+                            self.angle_stats[file_idx] = angle_stats
                     
+                    logger.info(
+                        f"文件 {os.path.basename(hdf5_file)}: "
+                        f"长度 {data_length}, 窗口数 {num_windows}"
+                    )
+            
             except Exception as e:
-                logger.error(f"加载文件 {hdf5_file} 时出错: {str(e)}")
+                logger.error(f"处理文件 {hdf5_file} 时出错: {str(e)}")
                 continue
         
-        logger.info(f"数据加载完成，总共 {len(self.data_indices)} 个样本")
-        
-    def _fit_scalers(self, file_idx: int, table: Any):
-        """为指定文件拟合标准化器"""
-        try:
-            # 检查数据结构
-            if hasattr(table.dtype, 'names') and table.dtype.names:
-                # 结构化数组，根据实际数据格式处理
-                field_names = table.dtype.names
-                
-                # 提取EMG数据
-                if 'emg' in field_names:
-                    emg_data = table['emg'][:]  # 形状应该是 (n_samples, 16)
-                    if len(emg_data.shape) == 2 and emg_data.shape[1] == 16:
-                        emg_scaler = StandardScaler()
-                        emg_scaler.fit(emg_data)
-                        self.emg_scalers[file_idx] = emg_scaler
-                
-                # 提取关节角度数据
-                if 'joint_angles' in field_names:
-                    angle_data = table['joint_angles'][:]  # 形状应该是 (n_samples, 20)
-                    if len(angle_data.shape) == 2 and angle_data.shape[1] == 20:  #确定有20个关节角度
-                        angle_scaler = StandardScaler()   # 创建标准化器
-                        angle_scaler.fit(angle_data)  
-                        self.angle_scalers[file_idx] = angle_scaler
-                        
-            else:
-                # 非结构化数组，假设是简单的数值矩阵
-                data = table[:]
-                if len(data.shape) == 2:
-                    # 假设前16列是EMG，后20列是关节角度
-                    if data.shape[1] >= 16:
-                        emg_data = data[:, :16]
-                        emg_scaler = StandardScaler()
-                        emg_scaler.fit(emg_data)
-                        self.emg_scalers[file_idx] = emg_scaler
-                    
-                    if data.shape[1] >= 36:  # 16 EMG + 20 joint angles
-                        angle_data = data[:, 16:36]
-                        angle_scaler = StandardScaler()
-                        angle_scaler.fit(angle_data)
-                        self.angle_scalers[file_idx] = angle_scaler
-                        
-        except Exception as e:
-            logger.warning(f"为文件索引 {file_idx} 拟合标准化器时出错: {str(e)}")
+        logger.info(f"预处理完成，总样本数: {len(self.window_indices)}")
     
-    def _read_window_data(self, file_idx: int, start_idx: int) -> Tuple[np.ndarray, np.ndarray]:
-        """读取指定窗口的数据"""
-        hdf5_file = self.hdf5_files[file_idx]
+    def _get_session(self, file_idx: int) -> SessionData:
+        """
+        获取会话数据（带缓存）
         
-        with h5py.File(hdf5_file, 'r') as f:
-            table = f[self.hdf5_group][self.table_name]
-            
-            # 读取窗口数据
-            end_idx = start_idx + self.window_size
-            window_raw = table[start_idx:end_idx]
-            
-            # 根据数据结构解析
-            if hasattr(table.dtype, 'names') and table.dtype.names:
-                # 结构化数组，直接访问字段
-                field_names = table.dtype.names
-                
-                # 提取EMG数据
-                if 'emg' in field_names:
-                    emg_data = window_raw['emg'].astype(np.float32)  # 形状: (window_size, 16)
-                else:
-                    emg_data = np.zeros((self.window_size, 16), dtype=np.float32)
-                
-                # 提取关节角度数据
-                if 'joint_angles' in field_names:
-                    angle_data = window_raw['joint_angles'].astype(np.float32)  # 形状: (window_size, 20)
-                else:
-                    angle_data = np.zeros((self.window_size, 20), dtype=np.float32)
-                    
-            else:
-                # 非结构化数组
-                window_data = window_raw.astype(np.float32)
-                if len(window_data.shape) == 2:
-                    # 假设前16列是EMG，后20列是关节角度
-                    if window_data.shape[1] >= 16:
-                        emg_data = window_data[:, :16]
-                    else:
-                        emg_data = np.zeros((self.window_size, 16), dtype=np.float32)
-                    
-                    if window_data.shape[1] >= 36:
-                        angle_data = window_data[:, 16:36]
-                    else:
-                        angle_data = np.zeros((self.window_size, 20), dtype=np.float32)
-                else:
-                    # 意外的数据形状
-                    emg_data = np.zeros((self.window_size, 16), dtype=np.float32)
-                    angle_data = np.zeros((self.window_size, 20), dtype=np.float32)
-            
-            # 标准化
-            if self.normalize:
-                if file_idx in self.emg_scalers:
-                    emg_data = self.emg_scalers[file_idx].transform(emg_data)
-                if file_idx in self.angle_scalers:
-                    angle_data = self.angle_scalers[file_idx].transform(angle_data)
-            
-            return emg_data, angle_data
+        在多worker环境下，每个worker维护自己的会话缓存
+        """
+        if file_idx not in self._sessions:
+            hdf5_file = self.hdf5_files[file_idx]
+            self._sessions[file_idx] = SessionData(
+                hdf5_file,
+                self.hdf5_group,
+                self.table_name,
+                self.chunk_cache_size
+            )
+        return self._sessions[file_idx]
     
-    def __len__(self) -> int:  #这种是类的公共方法，外部可以调用
-        """返回数据集大小"""
-        return len(self.data_indices)
+    def __len__(self) -> int:
+        return len(self.window_indices)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -213,11 +320,35 @@ class EMG2PoseDataset(Dataset):
             idx: 样本索引
             
         Returns:
-            emg_data: EMG数据 (window_size, emg_channels)
-            angle_data: 角度数据 (window_size, angle_channels)
+            emg_tensor: EMG数据 (window_size, emg_channels)
+            angle_tensor: 角度数据 (window_size, angle_channels)
         """
-        file_idx, start_idx = self.data_indices[idx]
-        emg_data, angle_data = self._read_window_data(file_idx, start_idx)
+        file_idx, start_idx = self.window_indices[idx]
+        end_idx = start_idx + self.window_size
+        
+        # 获取会话数据（带缓存）
+        session = self._get_session(file_idx)
+        
+        # 从磁盘读取窗口数据
+        emg_data, angle_data = session.get_window(start_idx, end_idx)
+        
+        # 处理缺失数据
+        if emg_data is None:
+            emg_data = np.zeros((self.window_size, 16), dtype=np.float32)
+        if angle_data is None:
+            angle_data = np.zeros((self.window_size, 20), dtype=np.float32)
+        
+        # 标准化
+        if self.normalize:
+            if file_idx in self.emg_stats:
+                mean = self.emg_stats[file_idx]['mean']
+                std = self.emg_stats[file_idx]['std']
+                emg_data = (emg_data - mean) / std
+            
+            if file_idx in self.angle_stats:
+                mean = self.angle_stats[file_idx]['mean']
+                std = self.angle_stats[file_idx]['std']
+                angle_data = (angle_data - mean) / std
         
         # 转换为PyTorch张量
         emg_tensor = torch.from_numpy(emg_data)
@@ -225,12 +356,18 @@ class EMG2PoseDataset(Dataset):
         
         return emg_tensor, angle_tensor
     
-    def get_scalers(self) -> Tuple[Dict[int, Any], Dict[int, Any]]:
-        """获取标准化器，用于反向变换"""
-        return self.emg_scalers, self.angle_scalers
+    def __del__(self):
+        """清理：关闭所有打开的HDF5文件"""
+        for session in self._sessions.values():
+            session.close()
+        self._sessions.clear()
+    
+    def get_stats(self) -> Tuple[Dict[int, Dict], Dict[int, Dict]]:
+        """获取标准化统计量"""
+        return self.emg_stats, self.angle_stats
 
 
-def load_hdf5_files(dataset_path: str) -> List[str]:   #这种是模块级函数，外部可以调用
+def load_hdf5_files(dataset_path: str) -> List[str]:
     """
     从指定目录加载所有HDF5文件
     

@@ -26,6 +26,10 @@ class DataConfig:
     split_ratio: List[float] = field(default_factory=lambda: [0.7, 0.15, 0.15])
     normalize: bool = False
     shuffle: bool = True
+    
+    # 内存优化配置
+    max_samples_for_normalize: int = 10000  # 标准化时的最大采样数
+    chunk_cache_size: int = 64 * 1024 * 1024  # HDF5 chunk cache大小（字节）64MB
 
 
 @dataclass
@@ -88,11 +92,18 @@ class TrainingConfig:
     early_stopping: bool = True
     patience: int = 20
     min_delta: float = 1e-4
+    monitor_metric: str = "val_loss"  # 监控指标：val_loss, val_mse, val_mae等
+    restore_best_weights: bool = True  # 是否恢复最佳权重
     
     # 设备配置
     device: str = "auto"
     num_workers: int = 4
     pin_memory: bool = True
+    
+    # 内存优化配置
+    persistent_workers: bool = True  # DataLoader worker持久化（PyTorch 1.7+）
+    prefetch_factor: int = 2  # 每个worker预取的batch数
+    compute_metrics_online: bool = True  # 在线计算metrics，避免大数组拼接
 
 
 @dataclass
@@ -176,6 +187,8 @@ class Config:
                 'split_ratio': self.data.split_ratio,
                 'normalize': self.data.normalize,
                 'shuffle': self.data.shuffle,
+                'max_samples_for_normalize': self.data.max_samples_for_normalize,
+                'chunk_cache_size': self.data.chunk_cache_size,
             },
             'model': {
                 'input_size': self.model.input_size,
@@ -213,9 +226,14 @@ class Config:
                 'early_stopping': self.training.early_stopping,
                 'patience': self.training.patience,
                 'min_delta': self.training.min_delta,
+                'monitor_metric': getattr(self.training, 'monitor_metric', 'val_loss'),
+                'restore_best_weights': getattr(self.training, 'restore_best_weights', True),
                 'device': self.training.device,
                 'num_workers': self.training.num_workers,
                 'pin_memory': self.training.pin_memory,
+                'persistent_workers': self.training.persistent_workers,
+                'prefetch_factor': self.training.prefetch_factor,
+                'compute_metrics_online': self.training.compute_metrics_online,
             },
             'logging': {
                 'checkpoint_dir': self.logging.checkpoint_dir,
