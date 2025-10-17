@@ -57,7 +57,11 @@ def create_dataloaders(config: Config) -> Tuple[DataLoader, DataLoader, DataLoad
     max_samples_for_normalize = getattr(config.data, 'max_samples_for_normalize', 10000)
     chunk_cache_size = getattr(config.data, 'chunk_cache_size', 64 * 1024 * 1024)
     
-    # 创建数据集（使用优化的TimeSeriesDataset）
+    # 获取新增的对齐配置
+    padding = getattr(config.data, 'padding', (0, 0))
+    skip_ik_failures = getattr(config.data, 'skip_ik_failures', False)
+    
+    # 创建数据集（使用对齐的TimeSeriesDataset）
     train_dataset = TimeSeriesDataset(
         hdf5_files=train_files,
         window_size=config.data.window_size,
@@ -65,6 +69,9 @@ def create_dataloaders(config: Config) -> Tuple[DataLoader, DataLoader, DataLoad
         table_name=config.data.table_name,
         normalize=config.data.normalize,
         stride=config.data.stride,
+        padding=padding,
+        jitter=True,  # 训练时启用jitter
+        skip_ik_failures=skip_ik_failures,
         max_samples_for_normalize=max_samples_for_normalize,
         chunk_cache_size=chunk_cache_size
     )
@@ -76,6 +83,9 @@ def create_dataloaders(config: Config) -> Tuple[DataLoader, DataLoader, DataLoad
         table_name=config.data.table_name,
         normalize=config.data.normalize,
         stride=config.data.stride,
+        padding=padding,
+        jitter=False,  # 验证时不使用jitter
+        skip_ik_failures=skip_ik_failures,
         max_samples_for_normalize=max_samples_for_normalize,
         chunk_cache_size=chunk_cache_size
     )
@@ -87,6 +97,9 @@ def create_dataloaders(config: Config) -> Tuple[DataLoader, DataLoader, DataLoad
         table_name=config.data.table_name,
         normalize=config.data.normalize,
         stride=config.data.stride,
+        padding=(0, 0),  # 测试时不使用padding
+        jitter=False,  # 测试时不使用jitter
+        skip_ik_failures=skip_ik_failures,
         max_samples_for_normalize=max_samples_for_normalize,
         chunk_cache_size=chunk_cache_size
     )

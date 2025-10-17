@@ -1,6 +1,6 @@
 """
-数据集类 - 懒加载和内存优化版本
-处理HDF5文件中的时序数据，采用懒加载策略最小化内存占用
+数据集类 - 对齐版本
+基于WindowedEmgDataset设计，支持padding、jitter、IK失败检测等功能
 """
 
 import os
@@ -12,6 +12,47 @@ from typing import List, Tuple, Dict, Any, Optional
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def get_ik_failures_mask(joint_angles: np.ndarray) -> np.ndarray:
+    """
+    计算IK失败mask（True表示没有失败）
+    
+    检测全零的joint_angles（表示IK失败）
+    
+    Args:
+        joint_angles: (..., num_joints) 关节角度数组
+        
+    Returns:
+        mask: (...,) 布尔数组，True表示该位置没有IK失败
+    """
+    zeros = np.zeros_like(joint_angles)
+    is_zero = np.isclose(joint_angles, zeros)
+    return ~np.all(is_zero, axis=-1)
+
+
+def get_contiguous_ones(binary_vector: np.ndarray) -> List[Tuple[int, int]]:
+    """
+    获取连续True值的(start_idx, end_idx)列表
+    
+    Args:
+        binary_vector: 布尔向量
+        
+    Returns:
+        连续块的列表 [(start, end), ...]
+    """
+    if (binary_vector == 0).all():
+        return []
+    
+    ones = np.where(binary_vector)[0]
+    boundaries = np.where(np.diff(ones) != 1)[0]
+    return [
+        (ones[i], ones[j])
+        for i, j in zip(
+            np.insert(boundaries + 1, 0, 0), 
+            np.append(boundaries, len(ones) - 1)
+        )
+    ]
 
 
 class SessionData:
@@ -88,6 +129,24 @@ class SessionData:
         if hasattr(self, '_file') and self._file:
             self._file.close()
             self._file = None
+    
+    @property
+    def no_ik_failure(self) -> np.ndarray:
+        """
+        获取IK失败mask（缓存）
+        
+        Returns:
+            布尔数组，True表示该位置没有IK失败
+        """
+        if not hasattr(self, '_no_ik_failure'):
+            # 读取所有joint_angles数据并计算mask
+            if self.is_structured and 'joint_angles' in self.field_names:
+                joint_angles = self.timeseries['joint_angles'][:]
+                self._no_ik_failure = get_ik_failures_mask(joint_angles)
+            else:
+                # 如果没有joint_angles字段，假设全部有效
+                self._no_ik_failure = np.ones(self.data_length, dtype=bool)
+        return self._no_ik_failure
     
     def get_window(self, start_idx: int, end_idx: int) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -185,13 +244,15 @@ class SessionData:
 
 class TimeSeriesDataset(Dataset):
     """
-    时序数据集类（内存优化版本）
+    时序数据集类（对齐版本）
     
     特点：
     - 懒加载：数据保留在磁盘，按需读取
-    - 预计算窗口索引：避免在内存中存储实际数据
-    - 采样式标准化：不加载全部数据
-    - 高效的HDF5访问：使用chunk cache
+    - padding支持：left和right padding用于上下文
+    - jitter：训练时随机抖动窗口位置
+    - skip_ik_failures：自动跳过IK失败的窗口
+    - 字典格式返回：与训练器对齐
+    - BCT格式：(batch, channels, time)
     
     Args:
         hdf5_files: HDF5文件路径列表
@@ -200,6 +261,9 @@ class TimeSeriesDataset(Dataset):
         table_name: 表名
         normalize: 是否标准化数据
         stride: 滑动窗口步长
+        padding: (left_padding, right_padding)元组
+        jitter: 是否启用训练时抖动
+        skip_ik_failures: 是否跳过IK失败的窗口
         max_samples_for_normalize: 标准化时的最大采样数
         chunk_cache_size: HDF5 chunk缓存大小（字节）
     """
@@ -212,6 +276,9 @@ class TimeSeriesDataset(Dataset):
         table_name: str = "timeseries",
         normalize: bool = False,
         stride: int = 1,
+        padding: Tuple[int, int] = (0, 0),
+        jitter: bool = False,
+        skip_ik_failures: bool = False,
         max_samples_for_normalize: int = 10000,
         chunk_cache_size: int = 64 * 1024 * 1024
     ):
@@ -221,10 +288,13 @@ class TimeSeriesDataset(Dataset):
         self.table_name = table_name
         self.normalize = normalize
         self.stride = stride
+        self.left_padding, self.right_padding = padding
+        self.jitter = jitter
+        self.skip_ik_failures = skip_ik_failures
         self.max_samples_for_normalize = max_samples_for_normalize
         self.chunk_cache_size = chunk_cache_size
         
-        # 窗口索引：存储 (file_idx, start_idx) 元组
+        # 窗口索引：存储 (file_idx, start_idx, end_idx) 元组
         self.window_indices = []
         
         # 标准化统计量（轻量级）
@@ -238,6 +308,9 @@ class TimeSeriesDataset(Dataset):
         self._preprocess()
         
         logger.info(f"数据集初始化完成：{len(self.window_indices)} 个样本窗口")
+        logger.info(f"  - padding: left={self.left_padding}, right={self.right_padding}")
+        logger.info(f"  - jitter: {self.jitter}")
+        logger.info(f"  - skip_ik_failures: {self.skip_ik_failures}")
     
     def _preprocess(self):
         """预处理：构建窗口索引并计算标准化统计量"""
@@ -266,11 +339,32 @@ class TimeSeriesDataset(Dataset):
                         )
                         continue
                     
-                    # 创建窗口索引（不存储实际数据）
-                    num_windows = (data_length - self.window_size) // self.stride + 1
-                    for i in range(num_windows):
-                        start_idx = i * self.stride
-                        self.window_indices.append((file_idx, start_idx))
+                    # 根据skip_ik_failures决定如何创建窗口索引
+                    if self.skip_ik_failures:
+                        # 获取IK失败mask并找到连续有效块
+                        no_ik_failure = session.no_ik_failure
+                        blocks = get_contiguous_ones(no_ik_failure)
+                        
+                        # 在每个有效块内创建窗口
+                        num_windows = 0
+                        for block_start, block_end in blocks:
+                            block_length = block_end - block_start + 1
+                            if block_length < self.window_size:
+                                continue
+                            
+                            # 在块内创建窗口
+                            for i in range((block_length - self.window_size) // self.stride + 1):
+                                start_idx = block_start + i * self.stride
+                                end_idx = block_end
+                                self.window_indices.append((file_idx, start_idx, end_idx))
+                                num_windows += 1
+                    else:
+                        # 不过滤IK失败，创建所有窗口
+                        num_windows = (data_length - self.window_size) // self.stride + 1
+                        for i in range(num_windows):
+                            start_idx = i * self.stride
+                            end_idx = data_length - 1
+                            self.window_indices.append((file_idx, start_idx, end_idx))
                     
                     # 如果需要标准化，计算统计量（采样方式）
                     if self.normalize:
@@ -312,7 +406,7 @@ class TimeSeriesDataset(Dataset):
     def __len__(self) -> int:
         return len(self.window_indices)
     
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         获取指定索引的数据样本
         
@@ -320,23 +414,41 @@ class TimeSeriesDataset(Dataset):
             idx: 样本索引
             
         Returns:
-            emg_tensor: EMG数据 (window_size, emg_channels)
-            angle_tensor: 角度数据 (window_size, angle_channels)
+            字典包含:
+                'emg': (emg_channels, time) EMG数据
+                'joint_angles': (angle_channels, time) 关节角度
+                'no_ik_failure': (time,) IK失败mask
+                'window_start_idx': 起始索引
+                'window_end_idx': 结束索引
         """
-        file_idx, start_idx = self.window_indices[idx]
-        end_idx = start_idx + self.window_size
+        file_idx, start_idx, end_idx = self.window_indices[idx]
+        
+        # 支持jitter：随机抖动窗口位置
+        offset = start_idx
+        leftover = end_idx - (offset + self.window_size)
+        if leftover > 0 and self.jitter:
+            # 随机抖动，但不超过stride
+            offset += np.random.randint(0, min(self.stride, leftover) + 1)
         
         # 获取会话数据（带缓存）
         session = self._get_session(file_idx)
         
+        # 扩展窗口以包含padding
+        window_start = max(offset - self.left_padding, 0)
+        window_end = min(offset + self.window_size + self.right_padding, len(session))
+        
         # 从磁盘读取窗口数据
-        emg_data, angle_data = session.get_window(start_idx, end_idx)
+        emg_data, angle_data = session.get_window(window_start, window_end)
         
         # 处理缺失数据
+        expected_length = window_end - window_start
         if emg_data is None:
-            emg_data = np.zeros((self.window_size, 16), dtype=np.float32)
+            emg_data = np.zeros((expected_length, 16), dtype=np.float32)
         if angle_data is None:
-            angle_data = np.zeros((self.window_size, 20), dtype=np.float32)
+            angle_data = np.zeros((expected_length, 20), dtype=np.float32)
+        
+        # 获取IK失败mask
+        no_ik_failure = session.no_ik_failure[window_start:window_end]
         
         # 标准化
         if self.normalize:
@@ -350,11 +462,18 @@ class TimeSeriesDataset(Dataset):
                 std = self.angle_stats[file_idx]['std']
                 angle_data = (angle_data - mean) / std
         
-        # 转换为PyTorch张量
-        emg_tensor = torch.from_numpy(emg_data)
-        angle_tensor = torch.from_numpy(angle_data)
+        # 转换为PyTorch张量并转置为(C, T)格式
+        emg_tensor = torch.from_numpy(emg_data).T  # (T, C) -> (C, T)
+        angle_tensor = torch.from_numpy(angle_data).T  # (T, C) -> (C, T)
+        no_ik_failure_tensor = torch.from_numpy(no_ik_failure.astype(np.float32))
         
-        return emg_tensor, angle_tensor
+        return {
+            'emg': emg_tensor,
+            'joint_angles': angle_tensor,
+            'no_ik_failure': no_ik_failure_tensor,
+            'window_start_idx': window_start,
+            'window_end_idx': window_end
+        }
     
     def __del__(self):
         """清理：关闭所有打开的HDF5文件"""

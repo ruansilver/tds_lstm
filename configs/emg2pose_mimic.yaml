@@ -1,0 +1,108 @@
+# 对齐配置 - 尽可能匹配论文实验配置
+# 用于复现和对比实验
+
+# 数据配置
+data:
+  dataset_path: "D:/Dataset/emg2pose_dataset"
+  hdf5_group: "emg2pose"
+  table_name: "timeseries"
+  stride: 1                                        # 密集采样
+    
+  emg_channels: 16
+  joint_angles_channels: 20
+  window_size: 10000                               # 对齐：5秒窗口 @ 2000Hz
+  
+  split_ratio: [0.7, 0.15, 0.15]
+  normalize: false                                 # 对齐：不使用标准化
+  shuffle: true
+  
+  # 对齐新增配置
+  padding: [0, 0]                                  # (left_padding, right_padding)
+  skip_ik_failures: false                          # 是否跳过IK失败样本
+  
+  # 内存优化配置
+  max_samples_for_normalize: 10000
+  chunk_cache_size: 67108864                       # 64MB cache
+
+# 模型配置 - 对齐TDS-LSTM架构
+model:
+  input_size: 16
+  output_size: 20
+  dropout: 0.0                                     # 对齐：不使用dropout
+  
+  # TDS编码器配置 - 多stage设计
+  tds_stages:
+    # Stage 1: 初始降采样和特征提取
+    - in_conv_kernel: 5
+      in_conv_stride: 2                            # 2000Hz -> 1000Hz
+      num_blocks: 2
+      channels: 8
+      feature_width: 4                             # 32 features
+      kernel_width: 21
+      
+    # Stage 2: 进一步特征抽象
+    - in_conv_kernel: 5
+      in_conv_stride: 2                            # 1000Hz -> 500Hz
+      num_blocks: 2
+      channels: 8
+      feature_width: 8                             # 64 features
+      kernel_width: 11
+  
+  # LSTM解码器配置
+  decoder_type: "sequential_lstm"
+  decoder_hidden_size: 128                         # 对齐
+  decoder_num_layers: 2                            # 对齐
+  decoder_state_condition: true                    # 对齐：使用状态条件
+  
+  # 时间配置
+  predict_velocity: false                          # 对齐：预测位置
+  rollout_freq: 50                                 # 对齐：50Hz解码频率
+  original_sampling_rate: 2000
+
+# 训练配置 - 对齐优化设置
+training:
+  num_epochs: 100                                  # 对齐：充分训练
+  batch_size: 32                                   # 对齐
+  learning_rate: 0.001                             # 对齐
+  weight_decay: 0.0                                # 对齐：不使用weight decay
+  
+  optimizer: "adam"                                # 对齐：Adam
+  scheduler: "none"                                # 对齐：不使用scheduler
+  
+  # 损失配置 - 对齐使用MAE
+  loss_type: "mae"                                 # 对齐：MAE loss
+  mae_weight: 1.0
+  
+  # 对齐新增配置
+  use_pose_module: false                           # 是否使用PoseModule包装
+  provide_initial_pos: false                       # 是否提供初始位置
+  
+  warmup_epochs: 0
+  gradient_clip_norm: 1.0
+  gradient_accumulation_steps: 1
+  
+  early_stopping: true
+  patience: 20                                     # 对齐：更大的patience
+  min_delta: 0.0001
+  monitor_metric: "val_loss"
+  restore_best_weights: true
+  
+  device: "auto"
+  num_workers: 4                                   # 对齐
+  pin_memory: true
+  
+  # 内存优化配置
+  persistent_workers: true
+  prefetch_factor: 2
+  compute_metrics_online: true
+
+# 日志配置
+logging:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  save_every: 5
+  log_every: 10
+  save_best_only: true
+  monitor: "val_loss"
+  mode: "min"
+

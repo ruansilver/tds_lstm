@@ -246,3 +246,216 @@ def print_metrics_summary(metrics: Dict[str, float], title: str = "评估指标"
         else:
             logger.info(f"{metric_name:15s}: {metric_value}")
     logger.info("-" * 50)
+
+
+# ========== 对齐metrics - 角度导数相关 ==========
+
+def calculate_angular_derivatives(
+    predictions: np.ndarray,
+    sample_rate: float = 2000.0
+) -> Dict[str, float]:
+    """
+    计算角度的导数指标：角速度、角加速度、角加速度变化率（jerk）
+    
+    Args:
+        predictions: 预测的关节角度 (batch, time, joints) 或 (time, joints)
+        sample_rate: 采样率（Hz）
+        
+    Returns:
+        包含导数指标的字典
+    """
+    if predictions.ndim == 2:
+        # (time, joints) -> (1, time, joints)
+        predictions = predictions[np.newaxis, :]
+    
+    # 计算导数（使用diff）
+    vel = np.diff(predictions, axis=1)  # 角速度
+    acc = np.diff(vel, axis=1)  # 角加速度  
+    jerk = np.diff(acc, axis=1)  # 角加速度变化率
+    
+    # 转换单位：从 (radians/sample) 到 (radians/second)
+    # 乘以采样率
+    vel_rps = vel * sample_rate
+    acc_rps2 = acc * sample_rate
+    jerk_rps3 = jerk * sample_rate
+    
+    # 计算平均绝对值
+    metrics = {
+        'angular_velocity': np.abs(vel_rps).mean(),
+        'angular_acceleration': np.abs(acc_rps2).mean(),
+        'angular_jerk': np.abs(jerk_rps3).mean()
+    }
+    
+    return metrics
+
+
+def calculate_angle_mae(
+    pred: np.ndarray,
+    target: np.ndarray,
+    mask: np.ndarray = None
+) -> float:
+    """
+    计算关节角度的平均绝对误差（考虑mask）
+    
+    Args:
+        pred: 预测角度 (batch, time, joints) 或 (time, joints)
+        target: 目标角度，形状与pred相同
+        mask: 可选的mask (batch, time) 或 (time,)，True表示有效
+        
+    Returns:
+        MAE值
+    """
+    if mask is not None:
+        # 扩展mask以匹配关节维度
+        if mask.ndim == 1 and pred.ndim == 2:
+            # (time,) -> (time, 1)
+            mask = mask[:, np.newaxis]
+        elif mask.ndim == 2 and pred.ndim == 3:
+            # (batch, time) -> (batch, time, 1)
+            mask = mask[:, :, np.newaxis]
+        
+        # 应用mask
+        valid_pred = pred[mask]
+        valid_target = target[mask]
+        
+        if len(valid_pred) == 0:
+            return 0.0
+        
+        return np.abs(valid_pred - valid_target).mean()
+    else:
+        return np.abs(pred - target).mean()
+
+
+def calculate_per_finger_mae(
+    pred: np.ndarray,
+    target: np.ndarray,
+    mask: np.ndarray = None
+) -> Dict[str, float]:
+    """
+    计算每个手指的MAE
+    
+    假设关节顺序为：
+    - Thumb: 0-3
+    - Index: 4-7
+    - Middle: 8-11
+    - Ring: 12-15
+    - Pinky: 16-19
+    
+    Args:
+        pred: 预测角度 (batch, time, 20) 或 (time, 20)
+        target: 目标角度
+        mask: 可选的mask
+        
+    Returns:
+        每个手指的MAE字典
+    """
+    # 定义手指的关节索引
+    finger_indices = {
+        'thumb': list(range(0, 4)),
+        'index': list(range(4, 8)),
+        'middle': list(range(8, 12)),
+        'ring': list(range(12, 16)),
+        'pinky': list(range(16, 20))
+    }
+    
+    per_finger_mae = {}
+    
+    for finger_name, indices in finger_indices.items():
+        # 提取该手指的关节
+        pred_finger = pred[..., indices]
+        target_finger = target[..., indices]
+        
+        # 计算该手指的MAE
+        mae = calculate_angle_mae(pred_finger, target_finger, mask)
+        per_finger_mae[f'mae_{finger_name}'] = mae
+    
+    return per_finger_mae
+
+
+def calculate_pd_groups_mae(
+    pred: np.ndarray,
+    target: np.ndarray,
+    mask: np.ndarray = None
+) -> Dict[str, float]:
+    """
+    计算近端(proximal)/中端(mid)/远端(distal)关节组的MAE
+    
+    关节分组（基于emg2pose的定义）：
+    - Proximal (近端): 每个手指的第一个关节
+    - Mid (中端): 每个手指的第二个关节
+    - Distal (远端): 每个手指的第三个关节
+    
+    Args:
+        pred: 预测角度
+        target: 目标角度
+        mask: 可选的mask
+        
+    Returns:
+        每个组的MAE字典
+    """
+    # 简化的分组（根据emg2pose的JOINTS定义）
+    pd_indices = {
+        'proximal': [0, 1, 4, 5, 8, 9, 12, 13, 16, 17],  # MCP关节
+        'mid': [2, 6, 10, 14, 18],  # PIP关节
+        'distal': [3, 7, 11, 15, 19]  # DIP/IP关节
+    }
+    
+    pd_mae = {}
+    
+    for group_name, indices in pd_indices.items():
+        # 提取该组的关节
+        pred_group = pred[..., indices]
+        target_group = target[..., indices]
+        
+        # 计算该组的MAE
+        mae = calculate_angle_mae(pred_group, target_group, mask)
+        pd_mae[f'mae_{group_name}'] = mae
+    
+    return pd_mae
+
+
+def calculate_comprehensive_metrics(
+    pred: np.ndarray,
+    target: np.ndarray,
+    mask: np.ndarray = None,
+    sample_rate: float = 2000.0,
+    include_derivatives: bool = True,
+    include_per_finger: bool = True,
+    include_pd_groups: bool = True
+) -> Dict[str, float]:
+    """
+    计算综合指标（对齐版本）
+    
+    Args:
+        pred: 预测角度
+        target: 目标角度
+        mask: 可选的mask
+        sample_rate: 采样率
+        include_derivatives: 是否包含导数指标
+        include_per_finger: 是否包含每个手指的MAE
+        include_pd_groups: 是否包含PD组的MAE
+        
+    Returns:
+        综合指标字典
+    """
+    metrics = {}
+    
+    # 基本MAE
+    metrics['mae'] = calculate_angle_mae(pred, target, mask)
+    
+    # 导数指标（角速度、角加速度、jerk）
+    if include_derivatives:
+        derivative_metrics = calculate_angular_derivatives(pred, sample_rate)
+        metrics.update(derivative_metrics)
+    
+    # 每个手指的MAE
+    if include_per_finger and pred.shape[-1] == 20:
+        finger_metrics = calculate_per_finger_mae(pred, target, mask)
+        metrics.update(finger_metrics)
+    
+    # PD组的MAE
+    if include_pd_groups and pred.shape[-1] == 20:
+        pd_metrics = calculate_pd_groups_mae(pred, target, mask)
+        metrics.update(pd_metrics)
+    
+    return metrics

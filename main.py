@@ -34,7 +34,7 @@ from utils.visualization import plot_predictions, plot_training_history
 
 # ===== 配置选择区域 =====
 # 修改这里来选择不同的配置文件
-SELECTED_CONFIG = 'default'  # 可选: 'quick_demo', 'default', 'high_performance'
+SELECTED_CONFIG = 'emg2pose_mimic'  # 可选: 'quick_demo', 'default', 'high_performance'
 
 # 高级选项
 RUN_MODE = 'full'           # 'train' | 'evaluate' | 'full'
@@ -131,9 +131,10 @@ class TrainingPipeline:
             logger.info(f"   📊 测试集样本数: {len(test_loader.dataset):,}")
             
             # 检查数据形状
-            for emg_data, angle_data in train_loader:
-                logger.info(f"   📏 EMG数据形状: {emg_data.shape}")
-                logger.info(f"   📏 关节角度形状: {angle_data.shape}")
+            for batch in train_loader:
+                logger.info(f"   📏 EMG数据形状: {batch['emg'].shape}")
+                logger.info(f"   📏 关节角度形状: {batch['joint_angles'].shape}")
+                logger.info(f"   📏 IK失败mask形状: {batch['no_ik_failure'].shape}")
                 break
                 
             return train_loader, val_loader, test_loader

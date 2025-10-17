@@ -206,7 +206,7 @@ class EMG2PoseTrainer:
         return optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=warmup_lambda)
     
     def train_epoch(self) -> Dict[str, float]:   
-        """训练一个epoch（内存优化版本）"""
+        """训练一个epoch（对齐版本，使用字典输入和mask过滤）"""
         self.model.train()  # 设置模型为训练模式
         total_loss = 0.0   # 累计损失
         
@@ -226,14 +226,40 @@ class EMG2PoseTrainer:
         # 梯度累积步数
         accumulation_steps = getattr(self.config.training, 'gradient_accumulation_steps', 1)
         
-        for batch_idx, (emg_data, angle_data) in enumerate(self.train_loader):
-            # 数据移到设备
-            emg_data = emg_data.to(self.device)
-            angle_data = angle_data.to(self.device)
+        # 检查是否使用PoseModule包装（需要字典输入）
+        use_pose_module = getattr(self.config.training, 'use_pose_module', False)
+        provide_initial_pos = getattr(self.config.training, 'provide_initial_pos', False)
+        
+        for batch_idx, batch_data in enumerate(self.train_loader):
+            # 将数据移到设备
+            batch = {k: v.to(self.device) for k, v in batch_data.items()}
             
-            # 前向传播
-            predictions = self.model(emg_data)
-            loss = self.criterion(predictions, angle_data)
+            if use_pose_module:
+                # 使用PoseModule：返回(pred, target, mask)
+                predictions, angle_data, no_ik_failure = self.model(batch, provide_initial_pos)
+            else:
+                # 直接使用模型：需要手动处理
+                emg_data = batch['emg']  # (B, C, T)
+                angle_data = batch['joint_angles']  # (B, C, T)
+                no_ik_failure = batch['no_ik_failure']  # (B, T)
+                
+                # 转换EMG格式给模型：(B, C, T) -> (B, T, C)
+                emg_data = emg_data.transpose(1, 2)
+                
+                predictions = self.model(emg_data)  # (B, T, C)
+                
+                # 转回BCT格式用于loss计算：(B, T, C) -> (B, C, T)
+                predictions = predictions.transpose(1, 2)  # (B, C, T)
+                # angle_data保持(B, C, T)不变
+            
+            # 计算损失（使用mask过滤IK失败的样本）
+            # 扩展mask: (B, T) -> (B, C, T)
+            mask = no_ik_failure.unsqueeze(1).expand_as(predictions).to(torch.bool)
+            
+            if mask.sum() > 0:  # 确保有有效样本
+                loss = self.criterion(predictions[mask], angle_data[mask])
+            else:
+                loss = torch.tensor(0.0, device=self.device, requires_grad=True)
             
             # 梯度累积：损失需要除以累积步数
             loss = loss / accumulation_steps
@@ -254,25 +280,30 @@ class EMG2PoseTrainer:
             # 统计损失（使用原始loss，不是除以accumulation_steps后的）
             total_loss += loss.item() * accumulation_steps
             
-            # 在线计算metrics（内存友好）
+            # 在线计算metrics（使用mask）
             if compute_metrics_online:
                 with torch.no_grad():
-                    batch_size = predictions.shape[0]
-                    num_samples += batch_size * predictions.shape[1]
-                    
-                    # 计算误差统计量
-                    squared_error = ((predictions - angle_data) ** 2).sum().item()
-                    absolute_error = torch.abs(predictions - angle_data).sum().item()
-                    
-                    sum_squared_error += squared_error
-                    sum_absolute_error += absolute_error
+                    mask = no_ik_failure.unsqueeze(1).expand_as(predictions).to(torch.bool)
+                    if mask.sum() > 0:
+                        valid_pred = predictions[mask]
+                        valid_target = angle_data[mask]
+                        
+                        num_samples += valid_pred.numel()
+                        squared_error = ((valid_pred - valid_target) ** 2).sum().item()
+                        absolute_error = torch.abs(valid_pred - valid_target).sum().item()
+                        
+                        sum_squared_error += squared_error
+                        sum_absolute_error += absolute_error
             else:
                 # 传统方式：收集样本
                 all_predictions.append(predictions.detach().cpu().numpy())
                 all_targets.append(angle_data.detach().cpu().numpy())
             
             # 内存清理：及时释放不需要的tensor
-            del emg_data, angle_data, predictions, loss
+            del predictions, loss
+            if 'emg_data' in locals():
+                del emg_data
+            del angle_data
             
             # 更激进的内存清理
             if batch_idx % 50 == 0:
@@ -316,7 +347,7 @@ class EMG2PoseTrainer:
         return {'loss': avg_loss, **metrics}
     
     def validate_epoch(self) -> Dict[str, float]:
-        """验证一个epoch（内存优化版本）"""
+        """验证一个epoch（对齐版本，使用字典输入和mask过滤）"""
         self.model.eval()
         total_loss = 0.0
         
@@ -331,35 +362,58 @@ class EMG2PoseTrainer:
             all_predictions = []
             all_targets = []
         
+        # 检查是否使用PoseModule包装
+        use_pose_module = getattr(self.config.training, 'use_pose_module', False)
+        provide_initial_pos = getattr(self.config.training, 'provide_initial_pos', False)
+        
         with torch.no_grad():
-            for batch_idx, (emg_data, angle_data) in enumerate(self.val_loader):
-                # 数据移到设备
-                emg_data = emg_data.to(self.device)
-                angle_data = angle_data.to(self.device)
+            for batch_idx, batch_data in enumerate(self.val_loader):
+                # 将数据移到设备
+                batch = {k: v.to(self.device) for k, v in batch_data.items()}
                 
-                # 前向传播
-                predictions = self.model(emg_data)
-                loss = self.criterion(predictions, angle_data)
+                if use_pose_module:
+                    predictions, angle_data, no_ik_failure = self.model(batch, provide_initial_pos)
+                else:
+                    emg_data = batch['emg']  # (B, C, T)
+                    angle_data = batch['joint_angles']  # (B, C, T)
+                    no_ik_failure = batch['no_ik_failure']  # (B, T)
+                    
+                    # 转换EMG格式：(B, C, T) -> (B, T, C)
+                    emg_data = emg_data.transpose(1, 2)
+                    predictions = self.model(emg_data)  # (B, T, C)
+                    # 转回BCT格式：(B, T, C) -> (B, C, T)
+                    predictions = predictions.transpose(1, 2)
+                    # angle_data保持(B, C, T)
                 
-                # 统计损失
+                # 计算损失（使用mask过滤）
+                mask = no_ik_failure.unsqueeze(1).expand_as(predictions).to(torch.bool)
+                if mask.sum() > 0:
+                    loss = self.criterion(predictions[mask], angle_data[mask])
+                else:
+                    loss = torch.tensor(0.0, device=self.device)
+                
                 total_loss += loss.item()
                 
-                # 在线计算metrics
+                # 在线计算metrics（使用mask）
                 if compute_metrics_online:
-                    batch_size = predictions.shape[0]
-                    num_samples += batch_size * predictions.shape[1]
-                    
-                    squared_error = ((predictions - angle_data) ** 2).sum().item()
-                    absolute_error = torch.abs(predictions - angle_data).sum().item()
-                    
-                    sum_squared_error += squared_error
-                    sum_absolute_error += absolute_error
+                    if mask.sum() > 0:
+                        valid_pred = predictions[mask]
+                        valid_target = angle_data[mask]
+                        
+                        num_samples += valid_pred.numel()
+                        squared_error = ((valid_pred - valid_target) ** 2).sum().item()
+                        absolute_error = torch.abs(valid_pred - valid_target).sum().item()
+                        
+                        sum_squared_error += squared_error
+                        sum_absolute_error += absolute_error
                 else:
                     all_predictions.append(predictions.cpu().numpy())
                     all_targets.append(angle_data.cpu().numpy())
                 
                 # 内存清理
-                del emg_data, angle_data, predictions, loss
+                del predictions, angle_data, loss
+                if 'emg_data' in locals():
+                    del emg_data
                 
                 if batch_idx % 50 == 0:
                     torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -511,7 +565,7 @@ class EMG2PoseTrainer:
         return result
     
     def evaluate(self) -> Dict[str, float]:
-        """在测试集上评估模型（内存优化版本）"""
+        """在测试集上评估模型（对齐版本，使用字典输入和mask过滤）"""
         if self.test_loader is None:
             logger.warning("没有提供测试数据加载器")
             return {}
@@ -532,35 +586,58 @@ class EMG2PoseTrainer:
             all_predictions = []
             all_targets = []
         
+        # 检查是否使用PoseModule包装
+        use_pose_module = getattr(self.config.training, 'use_pose_module', False)
+        provide_initial_pos = getattr(self.config.training, 'provide_initial_pos', False)
+        
         with torch.no_grad():
-            for batch_idx, (emg_data, angle_data) in enumerate(self.test_loader):
-                # 数据移到设备
-                emg_data = emg_data.to(self.device)
-                angle_data = angle_data.to(self.device)
+            for batch_idx, batch_data in enumerate(self.test_loader):
+                # 将数据移到设备
+                batch = {k: v.to(self.device) for k, v in batch_data.items()}
                 
-                # 前向传播
-                predictions = self.model(emg_data)
-                loss = self.criterion(predictions, angle_data)
+                if use_pose_module:
+                    predictions, angle_data, no_ik_failure = self.model(batch, provide_initial_pos)
+                else:
+                    emg_data = batch['emg']  # (B, C, T)
+                    angle_data = batch['joint_angles']  # (B, C, T)
+                    no_ik_failure = batch['no_ik_failure']  # (B, T)
+                    
+                    # 转换EMG格式：(B, C, T) -> (B, T, C)
+                    emg_data = emg_data.transpose(1, 2)
+                    predictions = self.model(emg_data)  # (B, T, C)
+                    # 转回BCT格式：(B, T, C) -> (B, C, T)
+                    predictions = predictions.transpose(1, 2)
+                    # angle_data保持(B, C, T)
                 
-                # 统计损失
+                # 计算损失（使用mask过滤）
+                mask = no_ik_failure.unsqueeze(1).expand_as(predictions).to(torch.bool)
+                if mask.sum() > 0:
+                    loss = self.criterion(predictions[mask], angle_data[mask])
+                else:
+                    loss = torch.tensor(0.0, device=self.device)
+                
                 total_loss += loss.item()
                 
-                # 在线计算metrics
+                # 在线计算metrics（使用mask）
                 if compute_metrics_online:
-                    batch_size = predictions.shape[0]
-                    num_samples += batch_size * predictions.shape[1]
-                    
-                    squared_error = ((predictions - angle_data) ** 2).sum().item()
-                    absolute_error = torch.abs(predictions - angle_data).sum().item()
-                    
-                    sum_squared_error += squared_error
-                    sum_absolute_error += absolute_error
+                    if mask.sum() > 0:
+                        valid_pred = predictions[mask]
+                        valid_target = angle_data[mask]
+                        
+                        num_samples += valid_pred.numel()
+                        squared_error = ((valid_pred - valid_target) ** 2).sum().item()
+                        absolute_error = torch.abs(valid_pred - valid_target).sum().item()
+                        
+                        sum_squared_error += squared_error
+                        sum_absolute_error += absolute_error
                 else:
                     all_predictions.append(predictions.cpu().numpy())
                     all_targets.append(angle_data.cpu().numpy())
                 
                 # 内存清理
-                del emg_data, angle_data, predictions, loss
+                del predictions, angle_data, loss
+                if 'emg_data' in locals():
+                    del emg_data
                 
                 if batch_idx % 50 == 0:
                     torch.cuda.empty_cache() if torch.cuda.is_available() else None
