@@ -336,7 +336,8 @@ def create_default_config() -> Config:
 CONFIG_FILES = {
     'quick_demo': 'configs/quick_demo.yaml',
     'default': 'configs/default.yaml',
-    'high_performance': 'configs/high_performance.yaml'
+    'high_performance': 'configs/high_performance.yaml',
+    'emg2pose_mimic': 'configs/emg2pose_mimic.yaml'
 }
 
 
