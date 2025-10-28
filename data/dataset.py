@@ -148,38 +148,58 @@ class SessionData:
                 self._no_ik_failure = np.ones(self.data_length, dtype=bool)
         return self._no_ik_failure
     
+    # def get_window(self, start_idx: int, end_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+    #     """
+    #     读取指定窗口的数据
+        
+    #     Args:
+    #         start_idx: 起始索引
+    #         end_idx: 结束索引
+            
+    #     Returns:
+    #         emg_data: EMG数据 (window_size, 16)
+    #         angle_data: 关节角度数据 (window_size, 20)
+    #     """
+    #     # 从磁盘读取窗口数据（懒加载）
+    #     window_raw = self.timeseries[start_idx:end_idx]
+        
+    #     # 根据数据结构解析
+    #     if self.is_structured:
+    #         # 结构化数组
+    #         emg_data = window_raw['emg'].astype(np.float32) if 'emg' in self.field_names else None
+    #         angle_data = window_raw['joint_angles'].astype(np.float32) if 'joint_angles' in self.field_names else None
+    #     else:
+    #         # 非结构化数组：假设前16列是EMG，后20列是关节角度
+    #         window_data = window_raw.astype(np.float32)
+    #         if len(window_data.shape) == 2 and window_data.shape[1] >= 36:
+    #             emg_data = window_data[:, :16]
+    #             angle_data = window_data[:, 16:36]
+    #         else:
+    #             emg_data = None
+    #             angle_data = None
+        
+    #     return emg_data, angle_data
     def get_window(self, start_idx: int, end_idx: int) -> Tuple[np.ndarray, np.ndarray]:
         """
-        读取指定窗口的数据
-        
-        Args:
-            start_idx: 起始索引
-            end_idx: 结束索引
-            
-        Returns:
-            emg_data: EMG数据 (window_size, 16)
-            angle_data: 关节角度数据 (window_size, 20)
-        """
-        # 从磁盘读取窗口数据（懒加载）
-        window_raw = self.timeseries[start_idx:end_idx]
-        
-        # 根据数据结构解析
-        if self.is_structured:
-            # 结构化数组
-            emg_data = window_raw['emg'].astype(np.float32) if 'emg' in self.field_names else None
-            angle_data = window_raw['joint_angles'].astype(np.float32) if 'joint_angles' in self.field_names else None
-        else:
-            # 非结构化数组：假设前16列是EMG，后20列是关节角度
-            window_data = window_raw.astype(np.float32)
-            if len(window_data.shape) == 2 and window_data.shape[1] >= 36:
-                emg_data = window_data[:, :16]
-                angle_data = window_data[:, 16:36]
-            else:
-                emg_data = None
-                angle_data = None
-        
-        return emg_data, angle_data
+    读取指定窗口的数据
     
+    Args:
+        start_idx: 起始索引
+        end_idx: 结束索引
+        
+    Returns:
+        emg_data: EMG数据 (window_size, 16)
+        angle_data: 关节角度数据 (window_size, 20)
+        """
+        # 注意：self.timeseries 是 h5py.Dataset，类型是结构化数据
+        try:
+            emg_data = self.timeseries['emg'][start_idx:end_idx].astype(np.float32)
+            angle_data = self.timeseries['joint_angles'][start_idx:end_idx].astype(np.float32)
+        except Exception as e:
+            print(f"[get_window] 数据提取失败: {e}")
+            print("timeseries dtype:", self.timeseries.dtype)
+            return None, None
+        return emg_data, angle_data
     def compute_statistics_sampled(
         self, 
         max_samples: int = 10000
@@ -439,7 +459,6 @@ class TimeSeriesDataset(Dataset):
         
         # 从磁盘读取窗口数据
         emg_data, angle_data = session.get_window(window_start, window_end)
-        
         # 处理缺失数据
         expected_length = window_end - window_start
         if emg_data is None:

@@ -9,6 +9,9 @@ import logging
 import inspect
 
 from .tds_lstm_model import TDSLSTMModel
+from .pose_modules import VEMG2PoseWithInitialState, BasePoseModule
+from .tds_network import TdsNetwork
+from .lstm_decoder import SequentialLSTM
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -34,6 +37,14 @@ class ModelRegistry:
             'original_sampling_rate': 2000,
             'dropout': 0.2,
             'predict_velocity': False,
+        })
+        
+        # 注册VEMG2PoseWithInitialState模型
+        self.register_model('vemg2pose', VEMG2PoseWithInitialState, {
+            'out_channels': 20,
+            'num_position_steps': 500,
+            'state_condition': True,
+            'rollout_freq': 50,
         })
     
     def register_model(self, name: str, model_class: Type[nn.Module], default_config: Optional[Dict[str, Any]] = None):
@@ -133,7 +144,12 @@ class ModelFactory:
         
         # 创建模型
         try:
-            model = model_class(**model_params)
+            # 特殊处理VEMG2PoseWithInitialState模型
+            if model_name == 'vemg2pose' or model_class == VEMG2PoseWithInitialState:
+                model = cls._create_vemg2pose_model(model_params, config)
+            else:
+                model = model_class(**model_params)
+                
             logger.info(f"✅ 创建模型: {model_name} ({model_class.__name__})")
             logger.debug(f"📊 模型参数: {model_params}")
             
@@ -148,6 +164,86 @@ class ModelFactory:
             logger.error(f"❌ 模型创建失败: {str(e)}")
             logger.error(f"🔍 模型类: {model_class}")
             logger.error(f"🔍 参数: {model_params}")
+            raise
+    
+    @classmethod
+    def _create_vemg2pose_model(cls, model_params: Dict[str, Any], config: Config) -> VEMG2PoseWithInitialState:
+        """创建VEMG2PoseWithInitialState模型"""
+        try:
+            # 从配置中提取网络和解码器参数
+            if config and hasattr(config, 'model'):
+                model_config = config.model
+                
+                # 创建TDS网络
+                if hasattr(model_config, 'network'):
+                    network_config = model_config.network
+                    
+                    # 创建conv_blocks
+                    conv_blocks = []
+                    if hasattr(network_config, 'conv_blocks'):
+                        for conv_cfg in network_config.conv_blocks:
+                            from .tds_network import Conv1dBlock
+                            conv_block = Conv1dBlock(
+                                in_channels=int(conv_cfg['in_channels']),
+                                out_channels=int(conv_cfg['out_channels']),
+                                kernel_size=int(conv_cfg['kernel_size']),
+                                stride=int(conv_cfg['stride'])
+                            )
+                            conv_blocks.append(conv_block)
+                    
+                    # 创建TDS stages
+                    tds_stages = []
+                    if hasattr(network_config, 'tds_stages'):
+                        for stage_cfg in network_config.tds_stages:
+                            from .tds_network import TdsStage
+                            out_ch = stage_cfg.get('out_channels')
+                            tds_stage = TdsStage(
+                                in_channels=int(stage_cfg.get('in_channels', 256)),
+                                in_conv_kernel_width=int(stage_cfg.get('in_conv_kernel_width', 17)),
+                                in_conv_stride=int(stage_cfg.get('in_conv_stride', 4)),
+                                num_blocks=int(stage_cfg.get('num_blocks', 2)),
+                                channels=int(stage_cfg.get('channels', 16)),
+                                feature_width=int(stage_cfg.get('feature_width', 16)),
+                                kernel_width=int(stage_cfg.get('kernel_width', 9)),
+                                out_channels=int(out_ch) if out_ch is not None else None
+                            )
+                            tds_stages.append(tds_stage)
+                    
+                    # 创建TdsNetwork（使用正确的构造方式）
+                    from .tds_network import TdsNetwork as TdsNetworkImpl
+                    network = TdsNetworkImpl(conv_blocks, tds_stages)
+                else:
+                    raise ValueError("配置中缺少network参数")
+                
+                # 创建解码器
+                if hasattr(model_config, 'decoder'):
+                    decoder_config = model_config.decoder
+                    decoder = SequentialLSTM(
+                        in_channels=int(decoder_config.get('in_channels', 84)),
+                        out_channels=int(decoder_config.get('out_channels', 40)),
+                        hidden_size=int(decoder_config.get('hidden_size', 512)),
+                        num_layers=int(decoder_config.get('num_layers', 2)),
+                        output_scale=float(decoder_config.get('scale', 0.01))
+                    )
+                else:
+                    raise ValueError("配置中缺少decoder参数")
+                
+                # 创建VEMG2PoseWithInitialState模型
+                model = VEMG2PoseWithInitialState(
+                    network=network,
+                    decoder=decoder,
+                    out_channels=int(model_params.get('out_channels', 20)),
+                    num_position_steps=int(getattr(model_config, 'num_position_steps', 500)),
+                    state_condition=bool(getattr(model_config, 'state_condition', True)),
+                    rollout_freq=int(model_params.get('rollout_freq', 50))
+                )
+                
+                return model
+            else:
+                raise ValueError("创建VEMG2PoseWithInitialState模型需要配置对象")
+                
+        except Exception as e:
+            logger.error(f"❌ VEMG2PoseWithInitialState模型创建失败: {str(e)}")
             raise
     
     @classmethod

@@ -1,0 +1,77 @@
+# 回归模型配置文件
+checkpoint_path: refer/checkpoint/regression_vemg2pose.ckpt
+model_name: regression_model
+
+# 模型配置
+model:
+  type: VEMG2PoseWithInitialState
+  provide_initial_pos: false
+  num_position_steps: 500
+  state_condition: true
+  
+  # 网络结构
+  network:
+    type: TdsNetwork
+    conv_blocks:
+      - in_channels: 16
+        out_channels: 256
+        kernel_size: 11
+        stride: 5
+      - in_channels: 256
+        out_channels: 256
+        kernel_size: 5
+        stride: 2
+    
+    tds_stages:
+      - in_channels: 256
+        channels: 16
+        feature_width: 16
+        in_conv_kernel_width: 17
+        in_conv_stride: 4
+        kernel_width: 9
+        num_blocks: 2
+      - in_channels: 256
+        channels: 16
+        feature_width: 16
+        in_conv_kernel_width: 9
+        in_conv_stride: 2
+        kernel_width: 5
+        num_blocks: 2
+        out_channels: 64
+  
+  # 解码器配置
+  decoder:
+    type: SequentialLSTM
+    in_channels: 84
+    out_channels: 40
+    hidden_size: 512
+    num_layers: 2
+    scale: 0.01
+
+# 数据配置
+data:
+  batch_size: 16
+  num_workers: 2
+  window_length: 10000
+  padding: [0, 0]
+  val_test_window_length: 10000
+  dataset_path: D:/Dataset/emg2pose_dataset_mini
+
+# 训练配置
+training:
+  loss_weights:
+    mae: 1.0
+    fingertip_distance: 0.01
+  learning_rate: 0.001
+
+# 评估配置
+evaluation:
+  metrics:
+    - angle_mae
+    - angle_mse
+    - angular_derivatives
+    - per_finger_angle_mae
+    - pd_angle_mae
+    - landmark_distances
+  output_format: json
+  save_predictions: false

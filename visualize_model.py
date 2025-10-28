@@ -96,13 +96,22 @@ def load_sample_data(config):
     
     # 获取第一个样本
     logger.info("加载第一个样本作为示例输入...")
-    emg_sample, angle_sample = dataset[0]
+    sample_dict = dataset[0]
     
-    # 添加batch维度: (time, channels) -> (1, time, channels)
-    sample_input = emg_sample.unsqueeze(0)
+    # 从字典中提取EMG数据
+    emg_sample = sample_dict['emg']  # 形状: (channels, time)
+    angle_sample = sample_dict['joint_angles']  # 形状: (channels, time)
     
-    logger.info(f"样本输入形状: {sample_input.shape}")
-    logger.info(f"样本输出形状: {angle_sample.shape}")
+    logger.info(f"EMG样本原始形状: {emg_sample.shape}")
+    logger.info(f"关节角度原始形状: {angle_sample.shape}")
+    
+    # 数据集返回的是 (channels, time) 格式
+    # 模型期望输入: (batch, time, channels) - 注意模型会在forward中转置
+    # 转换: (channels, time) -> (time, channels) -> (1, time, channels)
+    sample_input = emg_sample.T.unsqueeze(0)  # 先转置再添加batch维度
+    
+    logger.info(f"转换后的输入形状: {sample_input.shape}")
+    logger.info(f"期望的形状格式: (batch=1, time=窗口大小, channels=16)")
     
     return sample_input
 

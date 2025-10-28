@@ -4,7 +4,7 @@
 
 from .tds_lstm_model import TDSLSTMModel
 from .model_factory import create_model, ModelFactory, register_model, list_models
-from .pose_modules import BasePoseModule, PoseModule, StatePoseModule
+from .pose_modules import BasePoseModule, PoseModule, StatePoseModule, VEMG2PoseWithInitialState
 
 __all__ = [
     'TDSLSTMModel', 
@@ -14,5 +14,6 @@ __all__ = [
     'list_models',
     'BasePoseModule',
     'PoseModule',
-    'StatePoseModule'
+    'StatePoseModule',
+    'VEMG2PoseWithInitialState'
 ]

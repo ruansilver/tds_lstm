@@ -150,10 +150,16 @@ class TrainingPipeline:
         Returns:
             模型实例
         """
-        logger.info("🔧 创建TDS-LSTM模型...")
+        logger.info("🔧 创建模型...")
         
         try:
-            model = create_model('tds_lstm', self.config)
+            # 根据配置确定模型类型
+            if hasattr(self.config.model, 'type') and self.config.model.type == 'VEMG2PoseWithInitialState':
+                model = create_model('vemg2pose', self.config)
+                logger.info("使用VEMG2PoseWithInitialState模型")
+            else:
+                model = create_model('tds_lstm', self.config)
+                logger.info("使用TDS-LSTM模型")
             
             # 记录模型信息
             if hasattr(model, 'get_model_size'):

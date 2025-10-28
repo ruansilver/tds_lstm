@@ -239,7 +239,7 @@ class TDSConvEncoder(nn.Module):
 
 class TdsStage(nn.Module):
     """
-    TDS阶段模块
+    TDS阶段模块（对齐参考实现）
     
     包含：
     1. 初始Conv1d块（可选，用于降采样和通道变换）
@@ -248,7 +248,7 @@ class TdsStage(nn.Module):
     
     Args:
         in_channels: 输入通道数
-        in_conv_kernel: 初始卷积核大小
+        in_conv_kernel_width: 初始卷积核大小（对应参考实现）
         in_conv_stride: 初始卷积步长
         num_blocks: TDS块数量
         channels: TDS内部通道数
@@ -260,30 +260,38 @@ class TdsStage(nn.Module):
     
     def __init__(
         self,
-        in_channels: int,
-        in_conv_kernel: int,
-        in_conv_stride: int,
-        num_blocks: int,
-        channels: int,
-        feature_width: int,
-        kernel_width: int,
+        in_channels: int = 16,
+        in_conv_kernel_width: int = 5,
+        in_conv_stride: int = 1,
+        num_blocks: int = 1,
+        channels: int = 8,
+        feature_width: int = 2,
+        kernel_width: int = 1,
         out_channels: Optional[int] = None,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        # 兼容旧参数名
+        in_conv_kernel: Optional[int] = None
     ):
         super().__init__()
         
-        self.in_conv_kernel = in_conv_kernel
+        # 兼容参数名
+        if in_conv_kernel is not None:
+            in_conv_kernel_width = in_conv_kernel
+            
+        self.in_conv_kernel_width = in_conv_kernel_width
         self.in_conv_stride = in_conv_stride
         self.out_channels = out_channels
+        self.channels = channels
+        self.feature_width = feature_width
         
         num_features = channels * feature_width
         
         # 初始卷积块
-        if in_conv_kernel > 0:
+        if in_conv_kernel_width > 0:
             self.conv1d_block = Conv1dBlock(
                 in_channels,
                 num_features,
-                kernel_size=in_conv_kernel,
+                kernel_size=in_conv_kernel_width,
                 stride=in_conv_stride,
                 dropout=dropout
             )
@@ -291,7 +299,7 @@ class TdsStage(nn.Module):
             # 如果不需要初始卷积，确保输入通道数匹配
             if in_channels != num_features:
                 raise ValueError(
-                    f"当in_conv_kernel=0时，in_channels ({in_channels}) "
+                    f"当in_conv_kernel_width=0时，in_channels ({in_channels}) "
                     f"必须等于 channels * feature_width ({num_features})"
                 )
             self.conv1d_block = None
@@ -333,98 +341,63 @@ class TdsStage(nn.Module):
 
 class TdsNetwork(nn.Module):
     """
-    完整的TDS网络
+    完整的TDS网络（对齐参考实现）
     
-    由多个TDS阶段组成，每个阶段可以进行降采样和特征变换
+    由多个Conv1d块和TDS阶段组成，每个阶段可以进行降采样和特征变换
     
     Args:
-        in_channels: 输入通道数（EMG通道数）
-        stages_config: 各阶段的配置列表
+        conv_blocks: Conv1d块序列
+        tds_stages: TDS阶段序列
     """
     
-    def __init__(
-        self,
-        in_channels: int,
-        stages_config: List[Dict],
-        dropout: float = 0.1
-    ):
+    def __init__(self, conv_blocks, tds_stages):
         super().__init__()
-        
-        self.in_channels = in_channels
-        self.stages_config = stages_config
-        
-        # 构建各个stage
-        stages = []
-        current_channels = in_channels
-        
-        for i, stage_cfg in enumerate(stages_config):
-            stage = TdsStage(
-                in_channels=current_channels,
-                in_conv_kernel=stage_cfg.get('in_conv_kernel', 5),
-                in_conv_stride=stage_cfg.get('in_conv_stride', 2),
-                num_blocks=stage_cfg.get('num_blocks', 2),
-                channels=stage_cfg.get('channels', 8),
-                feature_width=stage_cfg.get('feature_width', 4),
-                kernel_width=stage_cfg.get('kernel_width', 21),
-                out_channels=stage_cfg.get('out_channels', None),
-                dropout=dropout
-            )
-            stages.append(stage)
-            
-            # 更新下一个stage的输入通道数
-            if stage.output_projection is not None:
-                current_channels = stage.out_channels
-            else:
-                current_channels = stage_cfg['channels'] * stage_cfg['feature_width']
-        
-        self.stages = nn.Sequential(*stages)
-        self.output_channels = current_channels
-        
-        # 计算left_context（用于时间对齐）
-        self.left_context = self._calculate_left_context()
+        self.layers = nn.Sequential(*conv_blocks, *tds_stages)
+        self.left_context = self._get_left_context(conv_blocks, tds_stages)
         self.right_context = 0
         
+        # 计算输出通道数
+        if tds_stages and hasattr(tds_stages[-1], 'out_channels') and tds_stages[-1].out_channels:
+            self.output_channels = tds_stages[-1].out_channels
+        else:
+            # 从最后一个stage计算
+            last_stage = tds_stages[-1] if tds_stages else None
+            if last_stage and hasattr(last_stage, 'channels') and hasattr(last_stage, 'feature_width'):
+                self.output_channels = last_stage.channels * last_stage.feature_width
+            else:
+                self.output_channels = 64  # 默认值
+        
         logger.info(f"TdsNetwork初始化完成:")
-        logger.info(f"  输入通道数: {in_channels}")
+        logger.info(f"  Conv1d块数量: {len(conv_blocks)}")
+        logger.info(f"  TDS阶段数量: {len(tds_stages)}")
         logger.info(f"  输出通道数: {self.output_channels}")
-        logger.info(f"  Stage数量: {len(stages_config)}")
         logger.info(f"  Left context: {self.left_context}")
-        
-    def _calculate_left_context(self) -> int:
-        """
-        计算网络的left context（感受野）
-        
-        这对于时间对齐很重要
-        """
-        left_context = 0
-        stride_product = 1
-        
-        for stage_cfg in self.stages_config:
-            # Conv1d块的贡献
-            kernel_size = stage_cfg.get('in_conv_kernel', 5)
-            stride = stage_cfg.get('in_conv_stride', 2)
-            
-            if kernel_size > 0:
-                left_context += (kernel_size - 1) * stride_product
-                stride_product *= stride
-            
-            # TDS块的贡献
-            num_blocks = stage_cfg.get('num_blocks', 2)
-            kernel_width = stage_cfg.get('kernel_width', 21)
-            
-            # 每个TDS块包含1个Conv2d和1个FC，只有Conv2d贡献context
-            left_context += num_blocks * (kernel_width - 1) * stride_product
-        
-        return left_context
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        前向传播
-        
-        输入: (batch, in_channels, time)
-        输出: (batch, output_channels, time')
-        """
-        return self.stages(x)
+
+    def forward(self, x):
+        return self.layers(x)
+
+    def _get_left_context(self, conv_blocks, tds_stages) -> int:
+        """计算left context（对齐参考实现）"""
+        left, stride = 0, 1
+
+        for conv_block in conv_blocks:
+            left += (conv_block.kernel_size - 1) * stride
+            stride *= conv_block.stride
+
+        for tds_stage in tds_stages:
+            # 从TDS stage中获取相关信息
+            if hasattr(tds_stage, 'conv1d_block') and tds_stage.conv1d_block:
+                conv_block = tds_stage.conv1d_block
+                left += (conv_block.kernel_size - 1) * stride
+                stride *= conv_block.stride
+
+            if hasattr(tds_stage, 'tds_encoder'):
+                tds_encoder = tds_stage.tds_encoder
+                if hasattr(tds_encoder, 'kernel_width') and hasattr(tds_encoder, 'num_blocks'):
+                    for _ in range(tds_encoder.num_blocks):
+                        left += (tds_encoder.kernel_width - 1) * stride
+
+        return left
     
     def get_output_channels(self) -> int:
         """获取输出通道数"""

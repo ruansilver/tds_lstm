@@ -27,6 +27,14 @@ class DataConfig:
     normalize: bool = False
     shuffle: bool = True
     
+    # 新增字段以支持新配置格式
+    batch_size: int = 16
+    num_workers: int = 2
+    window_length: int = 10000
+    val_test_window_length: int = 10000
+    padding: List[int] = field(default_factory=lambda: [0, 0])
+    skip_ik_failures: bool = False
+    
     # 内存优化配置
     max_samples_for_normalize: int = 10000  # 标准化时的最大采样数
     chunk_cache_size: int = 64 * 1024 * 1024  # HDF5 chunk cache大小（字节）64MB
@@ -43,6 +51,17 @@ class ModelConfig:
     hidden_size: int = 128
     num_layers: int = 2
     bidirectional: bool = True
+    
+    # 新增字段以支持VEMG2PoseWithInitialState
+    type: str = "tds_lstm"  # 模型类型
+    model_name: str = ""
+    network: Optional[Dict] = None
+    decoder: Optional[Dict] = None
+    num_position_steps: int = 500
+    provide_initial_pos: bool = False
+    state_condition: bool = True
+    rollout_freq: int = 50
+    original_sampling_rate: int = 2000
     
     # TDS-LSTM专用参数
     # TDS编码器配置

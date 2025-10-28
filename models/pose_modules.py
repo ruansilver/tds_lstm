@@ -292,3 +292,113 @@ class StatePoseModule(BasePoseModule):
         
         return preds
 
+
+class VEMG2PoseWithInitialState(BasePoseModule):
+    """
+    VEMG2Pose模块：预测初期步数的位置，之后集成速度
+    
+    这是论文中效果最好的模块，核心思想：
+    - 前num_position_steps步：直接预测位置
+    - 后续步骤：预测速度并累积到当前位置
+    
+    Args:
+        network: 编码器网络
+        decoder: 解码器（SequentialLSTM）  
+        out_channels: 输出通道数
+        num_position_steps: 预测位置的步数（之后预测速度）
+        state_condition: 是否使用状态条件
+        rollout_freq: rollout频率（Hz）  
+    """
+    
+    def __init__(
+        self,
+        network: nn.Module,
+        decoder: nn.Module,
+        out_channels: int = 20,
+        num_position_steps: int = 500,
+        state_condition: bool = True,
+        rollout_freq: int = 50
+    ):
+        super().__init__(network, out_channels)
+        self.decoder = decoder
+        self.num_position_steps = num_position_steps
+        self.state_condition = state_condition
+        self.rollout_freq = rollout_freq
+        
+        logger.info(f"VEMG2PoseWithInitialState初始化:")
+        logger.info(f"  num_position_steps: {num_position_steps}")
+        logger.info(f"  state_condition: {state_condition}")
+        logger.info(f"  rollout_freq: {rollout_freq}")
+    
+    def _predict_pose(
+        self, 
+        emg: torch.Tensor, 
+        initial_pos: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        VEMG2Pose预测逻辑
+        
+        Args:
+            emg: (B, C, T) EMG输入
+            initial_pos: (B, C) 初始位置
+            
+        Returns:
+            (B, C, T') 预测结果
+        """
+        # 1. 编码器提取特征
+        features = self.network(emg)  # (B, C', T')
+        
+        # 2. 计算rollout的时间长度
+        seconds = (emg.shape[-1] - self.left_context - self.right_context) / EMG_SAMPLE_RATE
+        n_time = round(seconds * self.rollout_freq)
+        n_time = max(1, n_time)
+        
+        # 3. 重采样特征到rollout频率
+        features = F.interpolate(
+            features, 
+            size=n_time, 
+            mode='linear', 
+            align_corners=True
+        )  # (B, C', n_time)
+        
+        # 4. 重置解码器状态
+        if hasattr(self.decoder, 'reset_state'):
+            self.decoder.reset_state()
+        
+        # 5. 计算在rollout频率下的position步数
+        num_position_steps = round(
+            self.num_position_steps * (self.rollout_freq / EMG_SAMPLE_RATE)
+        )
+        
+        # 6. 逐时间步解码
+        preds = [initial_pos]  # 初始位置
+        
+        for t in range(n_time):
+            # 当前特征
+            inputs = features[:, :, t]  # (B, C')
+            
+            # 如果使用状态条件，拼接上一步输出
+            if self.state_condition:
+                inputs = torch.cat([inputs, preds[-1]], dim=-1)  # (B, C'+out_C)
+            
+            # 解码器预测（输出包含位置和速度）
+            output = self.decoder(inputs)  # (B, 2*out_C)
+            
+            # 分离位置和速度预测
+            pos, vel = torch.split(output, output.shape[1] // 2, dim=1)
+            
+            # 根据当前时间步选择预测模式：
+            # - 前num_position_steps步：使用位置预测
+            # - 后续步：使用速度预测并累积
+            if t < num_position_steps:
+                pred = pos  # 直接预测位置
+            else:
+                pred = preds[-1] + vel  # 累积速度
+            
+            preds.append(pred)
+        
+        # 7. 堆叠结果（去掉initial_pos）
+        preds = torch.stack(preds[1:], dim=-1)  # (B, C, n_time)
+        
+        return preds
+

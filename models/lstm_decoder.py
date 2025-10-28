@@ -54,7 +54,8 @@ class SequentialLSTM(nn.Module):
         self.output_scale = output_scale
         
         # 如果使用状态条件，LSTM输入需要包含上一步输出
-        lstm_input_size = in_channels + (out_channels if state_condition else 0)
+        # 注意：这里的in_channels已经包含了特征+状态条件，所以不需要再加out_channels
+        lstm_input_size = in_channels
         
         # LSTM核心
         self.lstm = nn.LSTM(

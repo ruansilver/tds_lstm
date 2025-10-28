@@ -1,100 +1,129 @@
-# 对齐配置 - 尽可能匹配论文实验配置
-# 用于复现和对比实验
+# 最佳性能配置 - 基于regression_model.yaml优化
+# 匹配效果最好的模型配置
 
 # 数据配置
 data:
-  dataset_path: "D:/Dataset/emg2pose_dataset"
+  dataset_path: "D:/Dataset/emg2pose_dataset_mini"
+  batch_size: 16                                   # 对齐最佳配置
+  num_workers: 2
+  
+  # 窗口和采样配置
+  window_length: 10000                             # 对齐：5秒窗口 @ 2000Hz
+  val_test_window_length: 10000
+  padding: [0, 0]                                  # (left_padding, right_padding)
+  
+  # 兼容性配置（保留旧字段）
   hdf5_group: "emg2pose"
-  table_name: "timeseries"
-  stride: 1                                        # 密集采样
-    
+  table_name: "timeseries" 
+  stride: 10000
   emg_channels: 16
   joint_angles_channels: 20
-  window_size: 10000                               # 对齐：5秒窗口 @ 2000Hz
-  
+  window_size: 10000                               # 确保兼容
   split_ratio: [0.7, 0.15, 0.15]
-  normalize: false                                 # 对齐：不使用标准化
+  normalize: false
   shuffle: true
-  
-  # 对齐新增配置
-  padding: [0, 0]                                  # (left_padding, right_padding)
-  skip_ik_failures: false                          # 是否跳过IK失败样本
+  skip_ik_failures: true
   
   # 内存优化配置
   max_samples_for_normalize: 10000
-  chunk_cache_size: 67108864                       # 64MB cache
+  chunk_cache_size: 67108864
 
-# 模型配置 - 对齐TDS-LSTM架构
+# 模型配置 - 对齐最佳性能架构
 model:
-  input_size: 16
-  output_size: 20
-  dropout: 0.0                                     # 对齐：不使用dropout
+  type: VEMG2PoseWithInitialState                  # 对齐：使用最佳模型类型
+  model_name: regression_model
   
-  # TDS编码器配置 - 多stage设计
-  tds_stages:
-    # Stage 1: 初始降采样和特征提取
-    - in_conv_kernel: 5
-      in_conv_stride: 2                            # 2000Hz -> 1000Hz
-      num_blocks: 2
-      channels: 8
-      feature_width: 4                             # 32 features
-      kernel_width: 21
-      
-    # Stage 2: 进一步特征抽象
-    - in_conv_kernel: 5
-      in_conv_stride: 2                            # 1000Hz -> 500Hz
-      num_blocks: 2
-      channels: 8
-      feature_width: 8                             # 64 features
-      kernel_width: 11
+  # 网络架构配置
+  network:
+    type: TdsNetwork
+    # 初始卷积块配置（对齐最佳配置）
+    conv_blocks:
+      - in_channels: 16
+        kernel_size: 11                             # 对齐：更大的初始感受野
+        out_channels: 256                           # 对齐：更多特征通道
+        stride: 5                                   # 对齐：更大的降采样
+      - in_channels: 256
+        kernel_size: 5
+        out_channels: 256
+        stride: 2
+    
+    # TDS阶段配置（对齐最佳配置）
+    tds_stages:
+      - channels: 16                               # 对齐：更多通道
+        feature_width: 16                          # 对齐：更大特征宽度
+        in_channels: 256
+        in_conv_kernel_width: 17
+        in_conv_stride: 4
+        kernel_width: 9
+        num_blocks: 2
+      - channels: 16
+        feature_width: 16
+        in_channels: 256
+        in_conv_kernel_width: 9
+        in_conv_stride: 2
+        kernel_width: 5
+        num_blocks: 2
+        out_channels: 64                           # 对齐：输出通道
   
-  # LSTM解码器配置
-  decoder_type: "sequential_lstm"
-  decoder_hidden_size: 128                         # 对齐
-  decoder_num_layers: 2                            # 对齐
-  decoder_state_condition: true                    # 对齐：使用状态条件
+  # 解码器配置（对齐最佳配置）
+  decoder:
+    type: SequentialLSTM
+    hidden_size: 512                               # 对齐：更大隐藏层
+    in_channels: 84                                # 特征64 + 状态条件20 = 84
+    out_channels: 40                               # 对齐：位置20+速度20
+    num_layers: 2
+    scale: 0.01                                    # 对齐：输出缩放
+  
+  # VEMG2Pose特有配置
+  num_position_steps: 500                          # 对齐：位置预测步数
+  provide_initial_pos: false                       # 对齐：不提供初始位置
+  state_condition: true                            # 对齐：状态条件
   
   # 时间配置
-  predict_velocity: false                          # 对齐：预测位置
-  rollout_freq: 50                                 # 对齐：50Hz解码频率
+  rollout_freq: 50
   original_sampling_rate: 2000
 
-# 训练配置 - 对齐优化设置
+# 训练配置 - 对齐最佳优化设置
 training:
-  num_epochs: 100                                  # 对齐：充分训练
-  batch_size: 32                                   # 对齐
-  learning_rate: 0.001                             # 对齐
-  weight_decay: 0.0                                # 对齐：不使用weight decay
+  num_epochs: 100                                  # 训练轮数
+  batch_size: 16                                   # 对齐数据配置中的batch_size
+  learning_rate: 0.001                             # 对齐最佳配置
+  weight_decay: 0.0
+  optimizer: "adam"
+  scheduler: "none"
   
-  optimizer: "adam"                                # 对齐：Adam
-  scheduler: "none"                                # 对齐：不使用scheduler
+  # 损失权重配置（对齐最佳配置）
+  loss_weights:
+    mae: 1                                         # 对齐：主要损失
+    fingertip_distance: 0.01                       # 对齐：指尖距离约束
   
-  # 损失配置 - 对齐使用MAE
-  loss_type: "mae"                                 # 对齐：MAE loss
-  mae_weight: 1.0
-  
-  # 对齐新增配置
-  use_pose_module: false                           # 是否使用PoseModule包装
-  provide_initial_pos: false                       # 是否提供初始位置
-  
-  warmup_epochs: 0
-  gradient_clip_norm: 1.0
-  gradient_accumulation_steps: 1
-  
+  # 早停和监控
   early_stopping: true
-  patience: 20                                     # 对齐：更大的patience
+  patience: 20
   min_delta: 0.0001
   monitor_metric: "val_loss"
   restore_best_weights: true
   
+  # 设备和并行配置
   device: "auto"
-  num_workers: 4                                   # 对齐
   pin_memory: true
   
   # 内存优化配置
   persistent_workers: true
   prefetch_factor: 2
   compute_metrics_online: true
+
+# 评估配置（对齐最佳配置）
+evaluation:
+  metrics:
+    - angle_mae
+    - angle_mse  
+    - angular_derivatives
+    - per_finger_angle_mae
+    - pd_angle_mae
+    - landmark_distances
+  output_format: json
+  save_predictions: false
 
 # 日志配置
 logging:
